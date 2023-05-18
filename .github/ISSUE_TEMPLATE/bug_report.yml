@@ -1,5 +1,5 @@
 name: Bug Report
-description: File a bug report to help us improve.
+description: File a report of unexpected behavior.
 labels: ["bug"]
 body:
   - type: markdown
