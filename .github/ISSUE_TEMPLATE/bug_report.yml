@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         # Description
-        Thanks for taking the time and welcome to the Noirot family!
+        Thanks for taking the time to create the Issue, and welcome to the Noirot family!
   - type: textarea
     id: aim
     attributes:
@@ -54,7 +54,7 @@ body:
       description: How did you install Nargo?
       multiple: false
       options:
-        - Binary (Default)
+        - Binary
         - Compiled from source
   - type: input
     id: nargo-version
@@ -84,10 +84,6 @@ body:
       label: "@noir-lang/aztec_backend version"
       description: What is the version number? e.g. version in yarn.lock
       placeholder: "0.12.0"
-  - type: markdown
-    attributes:
-      value: |
-        ## Additional Context
   - type: textarea
     id: additional
     attributes:
