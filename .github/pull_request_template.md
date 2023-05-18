@@ -1,31 +1,55 @@
-\* = Mandatory
+# Description
 
-# Problem / Corresponding Issue(s)*
+<!-- Please fill out all fields marked with an asterisk (*). Thanks. -->
 
-<!-- Describe the problem this Pull Request (PR) resolves or link to the GitHub Issue that describes the problem. -->
+## Problem / Corresponding Issue(s)\*
+
+<!-- Describe the problem this Pull Request (PR) resolves / link to the GitHub Issue that describes the problem. -->
 
 Resolves <!-- Link to GitHub Issue -->
 
-# Summary*
+## Summary\*
 
 <!-- Describe the changes in this PR. -->
 
+## Example\*
 
+<!-- Code / step-by-step example(s) to demonstrate the effect of this PR. -->
 
-# Example*
+Before:
 
-<!-- Demonstrate the effect of this PR with code / step-by-step examples. -->
+```
+
+```
+
+After:
 
 ```
 
 ```
 
-# Additional context
+## Documentation Needs
 
-<!-- If applicable. -->
+<!-- Check this checkbox if this PR requires doc changes: -->
 
-# Checklist
+- [ ] This PR requires documentation updates when merged.
+
+<!-- Check one of the following if above is checked: -->
+
+    - [ ] I will submit a noir-lang/docs PR.
+
+        <!-- Submit a PR on https://github.com/noir-lang/docs. Thank you! -->
+
+    - [ ] I will request for Dev Rel's help in documenting this PR.
+
+        <!-- List / describe what needs to be documented. -->
+        <!-- Dev Rel will reach out for clarifications when needed. Thank you for supporting Dev Rel in advance! -->
+
+## Additional Context
+
+<!-- Supplement further information if applicable. -->
+
+# PR Checklist\*
 
 - [ ] I have tested the changes locally.
-- [ ] I have labeled this PR where applicable (e.g. `doc needed`, `ci-test`).
 - [ ] I have formatted the changes with [Prettier](https://prettier.io/) and/or `cargo fmt` on default settings.
