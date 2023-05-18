@@ -1,0 +1,41 @@
+name: Feature Request
+description: Suggest an idea for improving Noir.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to improve Noir!
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe what you feel lacking. (Supply code / step-by-step examples, if applicable.)
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Happy Case
+      description: Describe how you envision things should work. (Supply pseudocode / step-by-step examples, if applicable.)
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Describe less-happy cases you have considered, if any.
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Supplement further information, if applicable.
+  - type: dropdown
+    id: pr
+    attributes:
+      label: Would you like to submit a PR for this Issue?
+      description: Core contributors are more than happy to provide support, wherever applicable.
+      multiple: false
+      options:
+        - "Yes"
+        - "No"
