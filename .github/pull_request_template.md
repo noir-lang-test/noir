@@ -11,7 +11,7 @@ Resolves <!-- Link to GitHub Issue -->
 
 ## Summary\*
 
-<!-- Describe the changes in this PR. -->
+<!-- Describe the changes in this PR, particularly breaking changes if any. -->
 
 This PR sets out to
 
