@@ -36,10 +36,11 @@ body:
       value: |
         ## Pull Request
   - type: dropdown
-    id: pr_preference
+    id: pr-preference
     attributes:
       label: Would you like to submit a PR for this Issue?
       description: Fellow contributors are happy to provide support where applicable.
+      multiple: false
       options:
         - "No"
         - "Maybe"
@@ -47,7 +48,7 @@ body:
     validations:
       required: true
   - type: textarea
-    id: pr_support
+    id: pr-support
     attributes:
       label: Support Needs
       description: Support from other contributors you are looking for to create a PR for this Issue.
