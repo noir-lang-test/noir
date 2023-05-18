@@ -31,7 +31,7 @@ After:
 
 ```
 
-## Documentation Needs
+## Documentation
 
 - [ ] This PR requires documentation updates when merged.
 
