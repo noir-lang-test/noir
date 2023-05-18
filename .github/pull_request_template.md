@@ -1,8 +1,9 @@
 # Description
 
-<!-- Please fill out all fields marked with an asterisk (*). Thanks. -->
+<!-- Thanks for taking the time to improve Noir! -->
+<!-- Please fill out all fields marked with an asterisk (*). -->
 
-## Problem / Corresponding Issue(s)\*
+## Problem\*
 
 <!-- Describe the problem this Pull Request (PR) resolves / link to the GitHub Issue that describes the problem. -->
 
@@ -11,6 +12,8 @@ Resolves <!-- Link to GitHub Issue -->
 ## Summary\*
 
 <!-- Describe the changes in this PR. -->
+
+This PR sets out to
 
 ## Example\*
 
@@ -30,20 +33,18 @@ After:
 
 ## Documentation Needs
 
-<!-- Check this checkbox if this PR requires doc changes: -->
-
 - [ ] This PR requires documentation updates when merged.
 
-<!-- Check one of the following if above is checked: -->
+  <!-- If checked, check one of the following: -->
 
-    - [ ] I will submit a noir-lang/docs PR.
+  - [ ] I will submit a noir-lang/docs PR.
 
-        <!-- Submit a PR on https://github.com/noir-lang/docs. Thank you! -->
+  <!-- Submit a PR on https://github.com/noir-lang/docs. Thank you! -->
 
-    - [ ] I will request for Dev Rel's help in documenting this PR.
+  - [ ] I will request for and support Dev Rel's help in documenting this PR.
 
-        <!-- List / describe what needs to be documented. -->
-        <!-- Dev Rel will reach out for clarifications when needed. Thank you for supporting Dev Rel in advance! -->
+  <!-- List / describe what needs to be documented. -->
+  <!-- Dev Rel will reach out for clarifications when needed. Thank you! -->
 
 ## Additional Context
 
