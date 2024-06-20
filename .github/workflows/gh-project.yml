@@ -1,0 +1,22 @@
+name: Add new issue to GH project
+
+on:
+  issues:
+    types:
+      - opened
+
+env:
+  lang: ✏️ Language
+
+jobs:
+  issue_opened:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Move issue to ${{ env.lang }}
+        uses: leonsteinhaeuser/project-beta-automations@v2.1.0
+        with:
+          gh_token: ${{ secrets.GH_PROJECT_AUTO_ADD_3 }}
+          organization: noir-lang-test
+          project_id: 1
+          resource_node_id: ${{ github.event.issue.node_id }}
+          status_value: ${{ env.lang }} # Target status
