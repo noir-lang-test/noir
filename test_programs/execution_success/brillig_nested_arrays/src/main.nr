@@ -8,7 +8,7 @@ struct MyNote {
     header: Header,
 }
 
-unconstrained fn access_nested(notes: [MyNote; 2], x: Field, y: Field) -> Field {
+unconstrained fn access_nested(notes: [MyNote; 2], x: u32, y: u32) -> Field {
     notes[x].array[y] + notes[y].array[x] + notes[x].plain + notes[y].header.params[x]
 }
 
@@ -19,23 +19,25 @@ unconstrained fn create_inside_brillig() -> [MyNote; 2] {
     [note0, note1]
 }
 
-unconstrained fn assert_inside_brillig(notes: [MyNote; 2], x: Field, y: Field) {
+unconstrained fn assert_inside_brillig(notes: [MyNote; 2], x: u32, y: u32) {
     assert(access_nested(notes, x, y) == (2 + 4 + 3 + 1));
 }
 
-unconstrained fn create_and_assert_inside_brillig(x: Field, y: Field) {
+unconstrained fn create_and_assert_inside_brillig(x: u32, y: u32) {
     assert_inside_brillig(create_inside_brillig(), x, y);
 }
 
-fn main(x: Field, y: Field) {
-    let header = Header { params: [1, 2, 3] };
-    let note0 = MyNote { array: [1, 2], plain: 3, header };
-    let note1 = MyNote { array: [4, 5], plain: 6, header };
+fn main(x: u32, y: u32) {
+    // Safety: testing context
+    unsafe {
+        let header = Header { params: [1, 2, 3] };
+        let note0 = MyNote { array: [1, 2], plain: 3, header };
+        let note1 = MyNote { array: [4, 5], plain: 6, header };
 
-    assert(access_nested([note0, note1], x, y) == (2 + 4 + 3 + 1));
+        assert(access_nested([note0, note1], x, y) == (2 + 4 + 3 + 1));
 
-    let notes = create_inside_brillig();
-    assert_inside_brillig(notes, x, y);
-    create_and_assert_inside_brillig(x, y);
+        let notes = create_inside_brillig();
+        assert_inside_brillig(notes, x, y);
+        create_and_assert_inside_brillig(x, y);
+    }
 }
-

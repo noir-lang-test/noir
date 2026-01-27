@@ -1,44 +1,32 @@
 #[test]
-fn test_vec_new_foo() {
-    foo();
-}
-
-#[test(should_fail)]
-fn test_vec_new_bad() {
-    bad();
+fn test_vec_new_good() {
+    good();
 }
 
 // docs:start:new_example
-fn foo() -> BoundedVec<Field, 10> {
+fn good() -> BoundedVec<Field, 10> {
     // Ok! MaxLen is specified with a type annotation
     let v1: BoundedVec<Field, 3> = BoundedVec::new();
     let v2 = BoundedVec::new();
 
-    // Ok! MaxLen is known from the type of foo's return value
+    // Ok! MaxLen is known from the type of `good`'s return value
     v2
-}
-
-fn bad() {
-    let mut v3 = BoundedVec::new();
-
-    // Not Ok! We don't know if v3's MaxLen is at least 1, and the compiler often infers 0 by default.
-    v3.push(5);
 }
 // docs:end:new_example
 
 #[test]
 fn test_vec_push_pop() {
     let mut vec: BoundedVec<Field, 3> = BoundedVec::new();
-    assert(vec.len == 0);
+    assert(vec.len() == 0);
     vec.push(2);
-    assert(vec.len == 1);
+    assert(vec.len() == 1);
     vec.push(4);
-    assert(vec.len == 2);
+    assert(vec.len() == 2);
     vec.push(6);
-    assert(vec.len == 3);
+    assert(vec.len() == 3);
     let x = vec.pop();
     assert(x == 6);
-    assert(vec.len == 2);
+    assert(vec.len() == 2);
     assert(vec.get(0) == 2);
     assert(vec.get(1) == 4);
 }
@@ -52,7 +40,7 @@ fn test_vec_get_unchecked<N>() {
 }
 
 // docs:start:get_unchecked_example
-fn sum_of_first_three<N>(v: BoundedVec<u32, N>) -> u32 {
+fn sum_of_first_three<let N: u32>(v: BoundedVec<u32, N>) -> u32 {
     // Always ensure the length is larger than the largest
     // index passed to get_unchecked
     assert(v.len() > 2);
@@ -79,7 +67,7 @@ fn set_unchecked_example() {
 
     // We've now written past the end of `vec`.
     // As this index is still within the maximum potential length of `v`,
-    // it won't cause a constraint failure. 
+    // it won't cause a constraint failure.
     vec.set_unchecked(2, 42);
     println(vec);
 
@@ -169,7 +157,7 @@ fn test_vec_extend_from_array() {
     let mut vec: BoundedVec<Field, 3> = BoundedVec::new();
     vec.extend_from_array([2, 4]);
 
-    assert(vec.len == 2);
+    assert(vec.len() == 2);
     assert(vec.get(0) == 2);
     assert(vec.get(1) == 4);
     // docs:end:bounded-vec-extend-from-array-example
@@ -189,17 +177,17 @@ fn test_vec_extend_from_bounded_vec() {
     // docs:end:bounded-vec-extend-from-bounded-vec-example
 }
 
-#[test(should_fail_with="extend_from_array out of bounds")]
+#[test(should_fail_with = "extend_from_array out of bounds")]
 fn test_vec_extend_from_array_out_of_bound() {
     let mut vec: BoundedVec<Field, 2> = BoundedVec::new();
     vec.extend_from_array([2, 4, 6]);
 }
 
-#[test(should_fail_with="extend_from_array out of bounds")]
+#[test(should_fail_with = "extend_from_array out of bounds")]
 fn test_vec_extend_from_array_twice_out_of_bound() {
     let mut vec: BoundedVec<Field, 2> = BoundedVec::new();
     vec.extend_from_array([2]);
-    assert(vec.len == 1);
+    assert(vec.len() == 1);
     vec.extend_from_array([4, 6]);
 }
 
@@ -223,14 +211,14 @@ fn test_vec_get_uninitialized() {
     let _x = vec.get(0);
 }
 
-#[test(should_fail_with="push out of bounds")]
+#[test(should_fail_with = "push out of bounds")]
 fn test_vec_push_out_of_bound() {
     let mut vec: BoundedVec<Field, 1> = BoundedVec::new();
     vec.push(1);
     vec.push(2);
 }
 
-#[test(should_fail_with="extend_from_bounded_vec out of bounds")]
+#[test(should_fail_with = "extend_from_bounded_vec out of bounds")]
 fn test_vec_extend_from_bounded_vec_out_of_bound() {
     let mut vec: BoundedVec<Field, 2> = BoundedVec::new();
 
@@ -240,7 +228,7 @@ fn test_vec_extend_from_bounded_vec_out_of_bound() {
     vec.extend_from_bounded_vec(another_vec);
 }
 
-#[test(should_fail_with="extend_from_bounded_vec out of bounds")]
+#[test(should_fail_with = "extend_from_bounded_vec out of bounds")]
 fn test_vec_extend_from_bounded_vec_twice_out_of_bound() {
     let mut vec: BoundedVec<Field, 2> = BoundedVec::new();
     vec.extend_from_array([1, 2]);
@@ -269,4 +257,3 @@ fn test_vec_any_not_default() {
     vec.extend_from_array([2, 4]);
     assert(!vec.any(|v| v == default_value));
 }
-

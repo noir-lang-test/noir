@@ -1,7 +1,6 @@
 fn main(mut x: Field) {
     add1(&mut x);
     assert(x == 3);
-
     let mut s = S { y: x };
     s.add2();
     assert(s.y == 5);
@@ -21,28 +20,33 @@ fn main(mut x: Field) {
     let mut c = C { foo: 0, bar: &mut C2 { array: &mut [1, 2] } };
     *c.bar.array = [3, 4];
     assert(*c.bar.array == [3, 4]);
-
     regression_1887();
     regression_2054();
     regression_2030();
     regression_2255();
-
+    regression_6443();
     assert(x == 3);
     regression_2218_if_inner_if(x, 10);
     regression_2218_if_inner_else(20, x);
     regression_2218_else(x, 3);
     regression_2218_loop(x, 10);
-
     regression_2560(s_ref);
+    nested_struct_aliases(x, 10);
+    assert_eq(x, 3);
+    nested_struct_aliases(x, 3);
 }
 
 fn add1(x: &mut Field) {
     *x += 1;
 }
 
-struct S { y: Field }
+struct S {
+    y: Field,
+}
 
-struct Nested { y: &mut &mut Field }
+struct Nested {
+    y: &mut &mut Field,
+}
 
 struct C {
     foo: Field,
@@ -50,7 +54,7 @@ struct C {
 }
 
 struct C2 {
-    array: &mut [Field; 2]
+    array: &mut [Field; 2],
 }
 
 impl S {
@@ -74,8 +78,12 @@ fn regression_1887() {
     assert(foo.bar.x == 32);
 }
 
-struct Foo { bar: Bar }
-struct Bar { x: Field }
+struct Foo {
+    bar: Bar,
+}
+struct Bar {
+    x: Field,
+}
 
 impl Bar {
     fn mutate(&mut self) {
@@ -98,6 +106,7 @@ fn regression_2030() {
     let _ = *array[0];
     *array[0] = 1;
 }
+
 // The `mut x: &mut ...` caught a bug handling lvalues where a double-dereference would occur internally
 // in one step rather than being tracked by two separate steps. This lead to assigning the 1 value to the
 // incorrect outer `mut` reference rather than the correct `&mut` reference.
@@ -108,6 +117,18 @@ fn regression_2255() {
 }
 
 fn regression_2255_helper(mut x: &mut Field) {
+    *x = 1;
+}
+
+// Similar to `regression_2255` but without the double-dereferencing.
+// The test checks that `mem2reg` does not eliminate storing to a reference passed as a parameter.
+fn regression_6443() {
+    let x = &mut 0;
+    regression_6443_helper(x);
+    assert(*x == 1);
+}
+
+fn regression_6443_helper(x: &mut Field) {
     *x = 1;
 }
 
@@ -223,4 +244,66 @@ fn regression_2218_loop(x: Field, y: Field) {
 // Now, we insert as many `*` as necessary to get to `S`.
 fn regression_2560(s_ref: &mut S) {
     assert(s_ref.get_y() == 7);
+}
+
+struct MyStruct {
+    a: Field,
+    b: u32,
+}
+
+struct Outer {
+    inner: MyStruct,
+}
+
+fn nested_struct_aliases(x: Field, y: Field) {
+    let mut var = Outer { inner: MyStruct { a: 0, b: 0 } };
+    let ref_outer = &mut var;
+    let ref_inner1 = &mut ref_outer.inner;
+    let ref_inner2 = &mut var.inner;
+
+    if x != y {
+        (*ref_inner1).a = 5;
+        (*ref_inner1).b = 7;
+        (*ref_inner2).a = 3;
+        (*ref_inner2).b = 10;
+
+        for _ in 0..3 {
+            (*ref_inner1).a += 1;
+            (*ref_inner1).b += 2;
+            (*ref_inner2).a += 2;
+            (*ref_inner2).b += 4;
+        }
+    } else {
+        (*ref_inner2).a = 20;
+        (*ref_inner2).b = 15;
+        (*ref_inner1).a = 25;
+        (*ref_inner1).b = 30;
+
+        for _ in 0..3 {
+            (*ref_inner2).a += 5;
+            (*ref_inner2).b += 3;
+            (*ref_inner1).a += 4;
+            (*ref_inner1).b += 10;
+        }
+    }
+
+    if x != y {
+        assert(var.inner.a == 12);
+        assert(var.inner.b == 28);
+        assert(ref_inner1.a == 12);
+        assert(ref_inner1.b == 28);
+        assert(ref_inner2.a == 12);
+        assert(ref_inner2.b == 28);
+        assert(ref_outer.inner.a == 12);
+        assert(ref_outer.inner.b == 28);
+    } else {
+        assert(var.inner.a == 52);
+        assert(var.inner.b == 69);
+        assert(ref_inner1.a == 52);
+        assert(ref_inner1.b == 69);
+        assert(ref_inner2.a == 52);
+        assert(ref_inner2.b == 69);
+        assert(ref_outer.inner.a == 52);
+        assert(ref_outer.inner.b == 69);
+    }
 }

@@ -15,11 +15,9 @@ sidebar_position: 0
 
 The field type corresponds to the native field type of the proving backend.
 
-The size of a Noir field depends on the elliptic curve's finite field for the proving backend
-adopted. For example, a field would be a 254-bit integer when paired with the default backend that
-spans the Grumpkin curve.
+The size of a Noir field depends on the elliptic curve's finite field for the proving backend  adopted. For example, a field would be a 254-bit integer when paired with the default backend that spans the Grumpkin curve.
 
-Fields support integer arithmetic and are often used as the default numeric type in Noir:
+Fields support integer arithmetic:
 
 ```rust
 fn main(x : Field, y : Field)  {
@@ -27,11 +25,9 @@ fn main(x : Field, y : Field)  {
 }
 ```
 
-`x`, `y` and `z` are all private fields in this example. Using the `let` keyword we defined a new
-private value `z` constrained to be equal to `x + y`.
+`x`, `y` and `z` are all private fields in this example. Using the `let` keyword we defined a new private value `z` constrained to be equal to `x + y`.
 
-If proving efficiency is of priority, fields should be used as a default for solving problems.
-Smaller integer types (e.g. `u64`) incur extra range constraints.
+If proving efficiency is of priority, fields should be used as a default for solving problems. Smaller integer types (e.g. `u64`) incur extra range constraints.
 
 ## Methods
 
@@ -41,103 +37,43 @@ After declaring a Field, you can use these common methods on it:
 
 Transforms the field into an array of bits, Little Endian.
 
-```rust
-fn to_le_bits(_x : Field, _bit_size: u32) -> [u1]
-```
+#include_code to_le_bits noir_stdlib/src/field/mod.nr rust
 
 example:
 
-```rust
-fn main() {
-    let field = 2;
-    let bits = field.to_le_bits(32);
-}
-```
+#include_code to_le_bits_example noir_stdlib/src/field/mod.nr rust
+
 
 ### to_be_bits
 
 Transforms the field into an array of bits, Big Endian.
 
-```rust
-fn to_be_bits(_x : Field, _bit_size: u32) -> [u1]
-```
+#include_code to_be_bits noir_stdlib/src/field/mod.nr rust
 
 example:
 
-```rust
-fn main() {
-    let field = 2;
-    let bits = field.to_be_bits(32);
-}
-```
+#include_code to_be_bits_example noir_stdlib/src/field/mod.nr rust
+
 
 ### to_le_bytes
 
 Transforms into an array of bytes, Little Endian
 
-```rust
-fn to_le_bytes(_x : Field, byte_size: u32) -> [u8]
-```
+#include_code to_le_bytes noir_stdlib/src/field/mod.nr rust
 
 example:
 
-```rust
-fn main() {
-    let field = 2;
-    let bytes = field.to_le_bytes(4);
-}
-```
+#include_code to_le_bytes_example noir_stdlib/src/field/mod.nr rust
 
 ### to_be_bytes
 
 Transforms into an array of bytes, Big Endian
 
-```rust
-fn to_be_bytes(_x : Field, byte_size: u32) -> [u8]
-```
+#include_code to_be_bytes noir_stdlib/src/field/mod.nr rust
 
 example:
 
-```rust
-fn main() {
-    let field = 2;
-    let bytes = field.to_be_bytes(4);
-}
-```
-
-### to_le_radix
-
-Decomposes into a vector over the specified base, Little Endian
-
-```rust
-fn to_le_radix(_x : Field, _radix: u32, _result_len: u32) -> [u8]
-```
-
-example:
-
-```rust
-fn main() {
-    let field = 2;
-    let radix = field.to_le_radix(256, 4);
-}
-```
-
-### to_be_radix
-
-Decomposes into a vector over the specified base, Big Endian
-
-```rust
-fn to_be_radix(_x : Field, _radix: u32, _result_len: u32) -> [u8]
-```
-
-example:
-
-```rust
-fn main() {
-    let field = 2;
-    let radix = field.to_be_radix(256, 4);
-}
-```
+#include_code to_be_bytes_example noir_stdlib/src/field/mod.nr rust
 
 ### pow_32
 
@@ -161,16 +97,14 @@ fn main() {
 
 Adds a constraint to specify that the field can be represented with `bit_size` number of bits
 
-```rust
-fn assert_max_bit_size(self, bit_size: u32)
-```
+#include_code assert_max_bit_size noir_stdlib/src/field/mod.nr rust
 
 example:
 
 ```rust
 fn main() {
     let field = 2
-    field.assert_max_bit_size(32);
+    field.assert_max_bit_size::<32>();
 }
 ```
 

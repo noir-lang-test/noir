@@ -5,11 +5,12 @@ use noirc_errors::{Location, Span};
 use super::expr::{HirBlockExpression, HirExpression, HirIdent};
 use super::stmt::HirPattern;
 use super::traits::TraitConstraint;
-use crate::ast::{FunctionKind, FunctionReturnType, Visibility};
+use crate::ast::{BlockExpression, FunctionKind, FunctionReturnType};
 use crate::graph::CrateId;
 use crate::hir::def_map::LocalModuleId;
-use crate::macros_api::{BlockExpression, StructId};
-use crate::node_interner::{ExprId, NodeInterner, TraitId, TraitImplId};
+use crate::node_interner::{ExprId, NodeInterner, TraitId, TraitImplId, TypeId};
+use crate::shared::Visibility;
+
 use crate::{ResolvedGeneric, Type};
 
 /// A Hir function is a block expression with a list of statements.
@@ -88,8 +89,6 @@ impl From<Vec<Param>> for Parameters {
     }
 }
 
-pub type FunctionSignature = (Vec<Param>, Option<Type>);
-
 /// A FuncMeta contains the signature of the function and any associated meta data like
 /// the function's Location, FunctionKind, and attributes. If the function's body is
 /// needed, it can be retrieved separately via `NodeInterner::function(&self, &FuncId)`.
@@ -105,6 +104,10 @@ pub struct FuncMeta {
     /// Note that this includes separate entries for each identifier in e.g. tuple patterns.
     pub parameter_idents: Vec<HirIdent>,
 
+    /// The return type as (and if) it appears in the AST.
+    ///
+    /// This is distinct from the `FuncMeta::return_type()` method,
+    /// which gets the return type from the [FuncMeta::typ] field.
     pub return_type: FunctionReturnType,
 
     pub return_visibility: Visibility,
@@ -130,16 +133,24 @@ pub struct FuncMeta {
     // This flag is needed for the attribute check pass
     pub has_body: bool,
 
+    /// Trait constraints that were specified directly on this function.
     pub trait_constraints: Vec<TraitConstraint>,
 
-    /// The struct this function belongs to, if any
-    pub struct_id: Option<StructId>,
+    /// Trait constraints that came either from a parent item (for example a where clause on a
+    /// trait or trait impl) or from constraints on implicitly added named generics.
+    pub extra_trait_constraints: Vec<TraitConstraint>,
+
+    /// The type this method belongs to, if any
+    pub type_id: Option<TypeId>,
 
     // The trait this function belongs to, if any
     pub trait_id: Option<TraitId>,
 
     /// The trait impl this function belongs to, if any
     pub trait_impl: Option<TraitImplId>,
+
+    /// If this function is the one related to an enum variant, this holds its index (relative to `type_id`)
+    pub enum_variant_index: Option<usize>,
 
     /// True if this function is an entry point to the program.
     /// For non-contracts, this means the function is `main`.
@@ -168,35 +179,28 @@ pub struct FuncMeta {
 
 #[derive(Debug, Clone)]
 pub enum FunctionBody {
-    Unresolved(FunctionKind, BlockExpression, Span),
+    Unresolved(FunctionKind, BlockExpression, Location),
     Resolving,
     Resolved,
 }
 
 impl FuncMeta {
     /// A stub function does not have a body. This includes Builtin, LowLevel,
-    /// and Oracle functions in addition to method declarations within a trait.
+    /// and Oracle functions in addition to method declarations within a trait
+    /// without a body.
     ///
     /// We don't check the return type of these functions since it will always have
     /// an empty body, and we don't check for unused parameters.
     pub fn is_stub(&self) -> bool {
-        self.kind.can_ignore_return_type() || self.trait_id.is_some()
-    }
-
-    pub fn function_signature(&self) -> FunctionSignature {
-        let return_type = match self.return_type() {
-            Type::Unit => None,
-            typ => Some(typ.clone()),
-        };
-        (self.parameters.0.clone(), return_type)
+        self.kind.can_ignore_return_type()
     }
 
     /// Gives the (uninstantiated) return type of this function.
     pub fn return_type(&self) -> &Type {
         match &self.typ {
-            Type::Function(_, ret, _env) => ret,
+            Type::Function(_, ret, _env, _unconstrained) => ret,
             Type::Forall(_, typ) => match typ.as_ref() {
-                Type::Function(_, ret, _env) => ret,
+                Type::Function(_, ret, _env, _unconstrained) => ret,
                 _ => unreachable!(),
             },
             _ => unreachable!(),
@@ -216,5 +220,9 @@ impl FuncMeta {
             FunctionBody::Resolving => FunctionBody::Resolving,
             FunctionBody::Resolved => FunctionBody::Resolved,
         }
+    }
+
+    pub fn all_trait_constraints(&self) -> impl Iterator<Item = &TraitConstraint> {
+        self.trait_constraints.iter().chain(self.extra_trait_constraints.iter())
     }
 }

@@ -1,20 +1,23 @@
 use std::borrow::Cow;
 use std::fmt::Display;
 
-use crate::ast::{
-    Ident, ItemVisibility, Path, Pattern, Recoverable, Statement, StatementKind,
-    UnresolvedTraitConstraint, UnresolvedType, UnresolvedTypeData, Visibility,
-};
-use crate::hir::def_collector::errors::DefCollectorErrorKind;
-use crate::macros_api::StructId;
-use crate::node_interner::ExprId;
-use crate::token::{Attributes, Token, Tokens};
-use crate::{Kind, Type};
-use acvm::{acir::AcirField, FieldElement};
-use iter_extended::vecmap;
-use noirc_errors::{Span, Spanned};
+use thiserror::Error;
 
-use super::UnaryRhsMemberAccess;
+use crate::ast::{
+    Ident, ItemVisibility, Path, Pattern, Statement, UnresolvedTraitConstraint, UnresolvedType,
+    UnresolvedTypeData,
+};
+use crate::elaborator::PrimitiveType;
+use crate::node_interner::{ExprId, InternedExpressionKind, InternedStatementKind, QuotedTypeId};
+use crate::shared::Visibility;
+use crate::signed_field::SignedField;
+use crate::token::{Attributes, FmtStrFragment, IntegerTypeSuffix, Token, Tokens};
+use crate::{Kind, Type};
+use acvm::FieldElement;
+use iter_extended::vecmap;
+use noirc_errors::{Located, Location, Span};
+
+use super::{AsTraitPath, TraitBound, TypePath, UnsafeExpression};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ExpressionKind {
@@ -24,23 +27,37 @@ pub enum ExpressionKind {
     Index(Box<IndexExpression>),
     Call(Box<CallExpression>),
     MethodCall(Box<MethodCallExpression>),
+    Constrain(ConstrainExpression),
     Constructor(Box<ConstructorExpression>),
     MemberAccess(Box<MemberAccessExpression>),
     Cast(Box<CastExpression>),
     Infix(Box<InfixExpression>),
     If(Box<IfExpression>),
+    Match(Box<MatchExpression>),
     Variable(Path),
     Tuple(Vec<Expression>),
     Lambda(Box<Lambda>),
     Parenthesized(Box<Expression>),
     Quote(Tokens),
     Unquote(Box<Expression>),
-    Comptime(BlockExpression, Span),
+    Comptime(BlockExpression, Location),
+    Unsafe(UnsafeExpression),
+    AsTraitPath(Box<AsTraitPath>),
+    TypePath(Box<TypePath>),
 
     // This variant is only emitted when inlining the result of comptime
     // code. It is used to translate function values back into the AST while
     // guaranteeing they have the same instantiated type and definition id without resolving again.
     Resolved(ExprId),
+
+    // This is an interned ExpressionKind during comptime code.
+    // The actual ExpressionKind can be retrieved with a NodeInterner.
+    Interned(InternedExpressionKind),
+
+    /// Interned statements are allowed to be parsed as expressions in case they resolve
+    /// to an StatementKind::Expression or StatementKind::Semi.
+    InternedStatement(InternedStatementKind),
+
     Error,
 }
 
@@ -50,26 +67,65 @@ pub type UnresolvedGenerics = Vec<UnresolvedGeneric>;
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum UnresolvedGeneric {
-    Variable(Ident),
-    Numeric { ident: Ident, typ: UnresolvedType },
+    Variable(IdentOrQuotedType, Vec<TraitBound>),
+    Numeric { ident: IdentOrQuotedType, typ: UnresolvedType },
 }
 
-impl UnresolvedGeneric {
-    pub fn span(&self) -> Span {
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub enum IdentOrQuotedType {
+    Ident(Ident),
+
+    /// Already-resolved generics can be parsed as generics when a macro
+    /// splices existing types into a generic list. In this case we have
+    /// to validate the type refers to a named generic and treat that
+    /// as a ResolvedGeneric when this is resolved.
+    Quoted(QuotedTypeId, Location),
+}
+
+impl IdentOrQuotedType {
+    pub fn location(&self) -> Location {
         match self {
-            UnresolvedGeneric::Variable(ident) => ident.0.span(),
-            UnresolvedGeneric::Numeric { ident, typ } => {
-                ident.0.span().merge(typ.span.unwrap_or_default())
-            }
+            IdentOrQuotedType::Ident(ident) => ident.location(),
+            IdentOrQuotedType::Quoted(_, location) => *location,
         }
     }
 
-    pub fn kind(&self) -> Result<Kind, DefCollectorErrorKind> {
+    pub fn ident(&self) -> Option<&Ident> {
         match self {
-            UnresolvedGeneric::Variable(_) => Ok(Kind::Normal),
+            IdentOrQuotedType::Ident(ident) => Some(ident),
+            IdentOrQuotedType::Quoted(_, _) => None,
+        }
+    }
+}
+
+#[derive(Error, PartialEq, Eq, Debug, Clone)]
+#[error(
+    "`{typ}` is not a supported type for a numeric generic. The only supported types are integers, fields, and booleans"
+)]
+pub struct UnsupportedNumericGenericType {
+    pub name: Option<String>,
+    pub typ: String,
+    pub location: Location,
+}
+
+impl UnresolvedGeneric {
+    pub fn location(&self) -> Location {
+        match self {
+            UnresolvedGeneric::Variable(ident, _) => ident.location(),
+            UnresolvedGeneric::Numeric { ident, typ } => ident.location().merge(typ.location),
+        }
+    }
+
+    pub fn span(&self) -> Span {
+        self.location().span
+    }
+
+    pub fn kind(&self) -> Result<Kind, UnsupportedNumericGenericType> {
+        match self {
+            UnresolvedGeneric::Variable(_, _) => Ok(Kind::Normal),
             UnresolvedGeneric::Numeric { typ, .. } => {
                 let typ = self.resolve_numeric_kind_type(typ)?;
-                Ok(Kind::Numeric(Box::new(typ)))
+                Ok(Kind::numeric(typ))
             }
         }
     }
@@ -77,23 +133,34 @@ impl UnresolvedGeneric {
     fn resolve_numeric_kind_type(
         &self,
         typ: &UnresolvedType,
-    ) -> Result<Type, DefCollectorErrorKind> {
-        use crate::ast::UnresolvedTypeData::{FieldElement, Integer};
+    ) -> Result<Type, UnsupportedNumericGenericType> {
+        // TODO: this should be done with resolved types
+        // See https://github.com/noir-lang/noir/issues/8504
+        use crate::ast::UnresolvedTypeData::Named;
 
-        match typ.typ {
-            FieldElement => Ok(Type::FieldElement),
-            Integer(sign, bits) => Ok(Type::Integer(sign, bits)),
-            // Only fields and integers are supported for numeric kinds
-            _ => Err(DefCollectorErrorKind::UnsupportedNumericGenericType {
-                ident: self.ident().clone(),
-                typ: typ.typ.clone(),
-            }),
+        if let Named(path, _generics, _) = &typ.typ {
+            if path.segments.len() == 1 {
+                if let Some(primitive_type) =
+                    PrimitiveType::lookup_by_name(path.segments[0].ident.as_str())
+                {
+                    if let Some(typ) = primitive_type.to_integer_or_field() {
+                        return Ok(typ);
+                    }
+                }
+            }
         }
+
+        // Only fields and integers are supported for numeric kinds
+        let name = self.ident().ident().map(|name| name.to_string());
+        let type_string = typ.typ.to_string();
+        Err(UnsupportedNumericGenericType { name, typ: type_string, location: typ.location })
     }
 
-    pub(crate) fn ident(&self) -> &Ident {
+    pub fn ident(&self) -> &IdentOrQuotedType {
         match self {
-            UnresolvedGeneric::Variable(ident) | UnresolvedGeneric::Numeric { ident, .. } => ident,
+            UnresolvedGeneric::Variable(ident, _) | UnresolvedGeneric::Numeric { ident, .. } => {
+                ident
+            }
         }
     }
 }
@@ -101,67 +168,56 @@ impl UnresolvedGeneric {
 impl Display for UnresolvedGeneric {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnresolvedGeneric::Variable(ident) => write!(f, "{ident}"),
+            UnresolvedGeneric::Variable(ident, trait_bounds) => {
+                write!(f, "{ident}")?;
+                if !trait_bounds.is_empty() {
+                    write!(f, ": ")?;
+                    for (index, trait_bound) in trait_bounds.iter().enumerate() {
+                        if index > 0 {
+                            write!(f, " + ")?;
+                        }
+                        write!(f, "{trait_bound}")?;
+                    }
+                }
+                Ok(())
+            }
             UnresolvedGeneric::Numeric { ident, typ } => write!(f, "let {ident}: {typ}"),
+        }
+    }
+}
+
+impl Display for IdentOrQuotedType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IdentOrQuotedType::Ident(ident) => write!(f, "{ident}"),
+            IdentOrQuotedType::Quoted(..) => write!(f, "(quoted)"),
         }
     }
 }
 
 impl From<Ident> for UnresolvedGeneric {
     fn from(value: Ident) -> Self {
-        UnresolvedGeneric::Variable(value)
+        UnresolvedGeneric::Variable(IdentOrQuotedType::Ident(value), Vec::new())
     }
 }
 
 impl ExpressionKind {
-    pub fn into_path(self) -> Option<Path> {
-        match self {
-            ExpressionKind::Variable(path) => Some(path),
-            _ => None,
-        }
-    }
-
-    pub fn into_infix(self) -> Option<InfixExpression> {
-        match self {
-            ExpressionKind::Infix(infix) => Some(*infix),
-            _ => None,
-        }
-    }
-
     pub fn prefix(operator: UnaryOp, rhs: Expression) -> ExpressionKind {
         match (operator, &rhs) {
             (
                 UnaryOp::Minus,
-                Expression { kind: ExpressionKind::Literal(Literal::Integer(field, sign)), .. },
-            ) => ExpressionKind::Literal(Literal::Integer(*field, !sign)),
+                Expression {
+                    kind: ExpressionKind::Literal(Literal::Integer(field, suffix)), ..
+                },
+            ) if !field.is_negative() => {
+                ExpressionKind::Literal(Literal::Integer(-*field, *suffix))
+            }
             _ => ExpressionKind::Prefix(Box::new(PrefixExpression { operator, rhs })),
         }
     }
 
-    pub fn array(contents: Vec<Expression>) -> ExpressionKind {
-        ExpressionKind::Literal(Literal::Array(ArrayLiteral::Standard(contents)))
-    }
-
-    pub fn repeated_array(repeated_element: Expression, length: Expression) -> ExpressionKind {
-        ExpressionKind::Literal(Literal::Array(ArrayLiteral::Repeated {
-            repeated_element: Box::new(repeated_element),
-            length: Box::new(length),
-        }))
-    }
-
-    pub fn slice(contents: Vec<Expression>) -> ExpressionKind {
-        ExpressionKind::Literal(Literal::Slice(ArrayLiteral::Standard(contents)))
-    }
-
-    pub fn repeated_slice(repeated_element: Expression, length: Expression) -> ExpressionKind {
-        ExpressionKind::Literal(Literal::Slice(ArrayLiteral::Repeated {
-            repeated_element: Box::new(repeated_element),
-            length: Box::new(length),
-        }))
-    }
-
-    pub fn integer(contents: FieldElement) -> ExpressionKind {
-        ExpressionKind::Literal(Literal::Integer(contents, false))
+    pub fn integer(contents: FieldElement, suffix: Option<IntegerTypeSuffix>) -> ExpressionKind {
+        ExpressionKind::Literal(Literal::Integer(SignedField::positive(contents), suffix))
     }
 
     pub fn boolean(contents: bool) -> ExpressionKind {
@@ -176,41 +232,15 @@ impl ExpressionKind {
         ExpressionKind::Literal(Literal::RawStr(contents, hashes))
     }
 
-    pub fn format_string(contents: String) -> ExpressionKind {
-        ExpressionKind::Literal(Literal::FmtStr(contents))
-    }
-
-    pub fn constructor((type_name, fields): (Path, Vec<(Ident, Expression)>)) -> ExpressionKind {
-        ExpressionKind::Constructor(Box::new(ConstructorExpression {
-            type_name,
-            fields,
-            struct_type: None,
-        }))
-    }
-}
-
-impl Recoverable for ExpressionKind {
-    fn error(_: Span) -> Self {
-        ExpressionKind::Error
-    }
-}
-
-impl Recoverable for Expression {
-    fn error(span: Span) -> Self {
-        Expression::new(ExpressionKind::Error, span)
-    }
-}
-
-impl Recoverable for Option<Expression> {
-    fn error(span: Span) -> Self {
-        Some(Expression::new(ExpressionKind::Error, span))
+    pub fn format_string(fragments: Vec<FmtStrFragment>, length: u32) -> ExpressionKind {
+        ExpressionKind::Literal(Literal::FmtStr(fragments, length))
     }
 }
 
 #[derive(Debug, Eq, Clone)]
 pub struct Expression {
     pub kind: ExpressionKind,
-    pub span: Span,
+    pub location: Location,
 }
 
 // This is important for tests. Two expressions are the same, if their Kind is the same
@@ -222,77 +252,53 @@ impl PartialEq<Expression> for Expression {
 }
 
 impl Expression {
-    pub fn new(kind: ExpressionKind, span: Span) -> Expression {
-        Expression { kind, span }
+    pub fn new(kind: ExpressionKind, location: Location) -> Expression {
+        Expression { kind, location }
     }
 
-    pub fn member_access_or_method_call(
-        lhs: Expression,
-        rhs: UnaryRhsMemberAccess,
-        span: Span,
-    ) -> Expression {
-        let kind = match rhs.method_call {
-            None => {
-                let rhs = rhs.method_or_field;
-                ExpressionKind::MemberAccess(Box::new(MemberAccessExpression { lhs, rhs }))
+    /// Returns the innermost location that gives this expression its type.
+    pub fn type_location(&self) -> Location {
+        match &self.kind {
+            ExpressionKind::Block(block_expression)
+            | ExpressionKind::Comptime(block_expression, _)
+            | ExpressionKind::Unsafe(UnsafeExpression { block: block_expression, .. }) => {
+                if let Some(statement) = block_expression.statements.last() {
+                    statement.type_location()
+                } else {
+                    self.location
+                }
             }
-            Some(method_call) => ExpressionKind::MethodCall(Box::new(MethodCallExpression {
-                object: lhs,
-                method_name: rhs.method_or_field,
-                generics: method_call.turbofish,
-                arguments: method_call.args,
-                is_macro_call: method_call.macro_call,
-            })),
-        };
-        Expression::new(kind, span)
-    }
-
-    pub fn index(collection: Expression, index: Expression, span: Span) -> Expression {
-        let kind = ExpressionKind::Index(Box::new(IndexExpression { collection, index }));
-        Expression::new(kind, span)
-    }
-
-    pub fn cast(lhs: Expression, r#type: UnresolvedType, span: Span) -> Expression {
-        let kind = ExpressionKind::Cast(Box::new(CastExpression { lhs, r#type }));
-        Expression::new(kind, span)
-    }
-
-    pub fn call(
-        lhs: Expression,
-        is_macro_call: bool,
-        arguments: Vec<Expression>,
-        span: Span,
-    ) -> Expression {
-        // Need to check if lhs is an if expression since users can sequence if expressions
-        // with tuples without calling them. E.g. `if c { t } else { e }(a, b)` is interpreted
-        // as a sequence of { if, tuple } rather than a function call. This behavior matches rust.
-        let kind = if matches!(&lhs.kind, ExpressionKind::If(..)) {
-            ExpressionKind::Block(BlockExpression {
-                statements: vec![
-                    Statement { kind: StatementKind::Expression(lhs), span },
-                    Statement {
-                        kind: StatementKind::Expression(Expression::new(
-                            ExpressionKind::Tuple(arguments),
-                            span,
-                        )),
-                        span,
-                    },
-                ],
-            })
-        } else {
-            ExpressionKind::Call(Box::new(CallExpression {
-                func: Box::new(lhs),
-                is_macro_call,
-                arguments,
-            }))
-        };
-        Expression::new(kind, span)
+            ExpressionKind::Parenthesized(expression) => expression.type_location(),
+            ExpressionKind::Literal(..)
+            | ExpressionKind::Prefix(..)
+            | ExpressionKind::Index(..)
+            | ExpressionKind::Call(..)
+            | ExpressionKind::MethodCall(..)
+            | ExpressionKind::Constrain(..)
+            | ExpressionKind::Constructor(..)
+            | ExpressionKind::MemberAccess(..)
+            | ExpressionKind::Cast(..)
+            | ExpressionKind::Infix(..)
+            | ExpressionKind::If(..)
+            | ExpressionKind::Match(..)
+            | ExpressionKind::Variable(..)
+            | ExpressionKind::Tuple(..)
+            | ExpressionKind::Lambda(..)
+            | ExpressionKind::Quote(..)
+            | ExpressionKind::Unquote(..)
+            | ExpressionKind::AsTraitPath(..)
+            | ExpressionKind::TypePath(..)
+            | ExpressionKind::Resolved(..)
+            | ExpressionKind::Interned(..)
+            | ExpressionKind::InternedStatement(..)
+            | ExpressionKind::Error => self.location,
+        }
     }
 }
 
-pub type BinaryOp = Spanned<BinaryOpKind>;
+pub type BinaryOp = Located<BinaryOpKind>;
 
-#[derive(PartialEq, PartialOrd, Eq, Ord, Hash, Debug, Copy, Clone)]
+#[derive(PartialEq, PartialOrd, Eq, Ord, Hash, Debug, Copy, Clone, strum_macros::EnumIter)]
 pub enum BinaryOpKind {
     Add,
     Subtract,
@@ -328,6 +334,31 @@ impl BinaryOpKind {
         )
     }
 
+    /// `==` and `!=`
+    pub fn is_equality(self) -> bool {
+        matches!(self, BinaryOpKind::Equal | BinaryOpKind::NotEqual)
+    }
+
+    /// `+`, `-`, `*`, `/` and `%`
+    pub fn is_arithmetic(self) -> bool {
+        matches!(
+            self,
+            BinaryOpKind::Add
+                | BinaryOpKind::Subtract
+                | BinaryOpKind::Multiply
+                | BinaryOpKind::Divide
+                | BinaryOpKind::Modulo
+        )
+    }
+
+    pub fn is_bitwise(self) -> bool {
+        matches!(self, BinaryOpKind::And | BinaryOpKind::Or | BinaryOpKind::Xor)
+    }
+
+    pub fn is_bitshift(self) -> bool {
+        matches!(self, BinaryOpKind::ShiftLeft | BinaryOpKind::ShiftRight)
+    }
+
     pub fn is_valid_for_field_type(self) -> bool {
         matches!(
             self,
@@ -340,7 +371,7 @@ impl BinaryOpKind {
         )
     }
 
-    pub fn as_string(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             BinaryOpKind::Add => "+",
             BinaryOpKind::Subtract => "-",
@@ -360,39 +391,20 @@ impl BinaryOpKind {
             BinaryOpKind::Modulo => "%",
         }
     }
-
-    pub fn as_token(self) -> Token {
-        match self {
-            BinaryOpKind::Add => Token::Plus,
-            BinaryOpKind::Subtract => Token::Minus,
-            BinaryOpKind::Multiply => Token::Star,
-            BinaryOpKind::Divide => Token::Slash,
-            BinaryOpKind::Equal => Token::Equal,
-            BinaryOpKind::NotEqual => Token::NotEqual,
-            BinaryOpKind::Less => Token::Less,
-            BinaryOpKind::LessEqual => Token::LessEqual,
-            BinaryOpKind::Greater => Token::Greater,
-            BinaryOpKind::GreaterEqual => Token::GreaterEqual,
-            BinaryOpKind::And => Token::Ampersand,
-            BinaryOpKind::Or => Token::Pipe,
-            BinaryOpKind::Xor => Token::Caret,
-            BinaryOpKind::ShiftLeft => Token::ShiftLeft,
-            BinaryOpKind::ShiftRight => Token::ShiftRight,
-            BinaryOpKind::Modulo => Token::Percent,
-        }
-    }
 }
 
 #[derive(PartialEq, PartialOrd, Eq, Ord, Hash, Debug, Copy, Clone)]
 pub enum UnaryOp {
     Minus,
     Not,
-    MutableReference,
+    Reference {
+        mutable: bool,
+    },
 
-    /// If implicitly_added is true, this operation was implicitly added by the compiler for a
+    /// If `implicitly_added` is true, this operation was implicitly added by the compiler for a
     /// field dereference. The compiler may undo some of these implicitly added dereferences if
     /// the reference later turns out to be needed (e.g. passing a field by reference to a function
-    /// requiring an &mut parameter).
+    /// requiring an `&mut` parameter).
     Dereference {
         implicitly_added: bool,
     },
@@ -412,12 +424,12 @@ impl UnaryOp {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Literal {
     Array(ArrayLiteral),
-    Slice(ArrayLiteral),
+    Vector(ArrayLiteral),
     Bool(bool),
-    Integer(FieldElement, /*sign*/ bool), // false for positive integer and true for negative
+    Integer(SignedField, Option<IntegerTypeSuffix>),
     Str(String),
     RawStr(String, u8),
-    FmtStr(String),
+    FmtStr(Vec<FmtStrFragment>, u32 /* length */),
     Unit,
 }
 
@@ -449,10 +461,17 @@ pub struct IfExpression {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub struct MatchExpression {
+    pub expression: Expression,
+    pub rules: Vec<(/*pattern*/ Expression, /*branch*/ Expression)>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Lambda {
-    pub parameters: Vec<(Pattern, UnresolvedType)>,
-    pub return_type: UnresolvedType,
+    pub parameters: Vec<(Pattern, Option<UnresolvedType>)>,
+    pub return_type: Option<UnresolvedType>,
     pub body: Expression,
+    pub unconstrained: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -475,7 +494,7 @@ pub struct FunctionDefinition {
     pub generics: UnresolvedGenerics,
     pub parameters: Vec<Param>,
     pub body: BlockExpression,
-    pub span: Span,
+    pub location: Location,
     pub where_clause: Vec<UnresolvedTraitConstraint>,
     pub return_type: FunctionReturnType,
     pub return_visibility: Visibility,
@@ -486,13 +505,13 @@ pub struct Param {
     pub visibility: Visibility,
     pub pattern: Pattern,
     pub typ: UnresolvedType,
-    pub span: Span,
+    pub location: Location,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum FunctionReturnType {
     /// Returns type is not specified.
-    Default(Span),
+    Default(Location),
     /// Everything else.
     Ty(UnresolvedType),
 }
@@ -522,13 +541,8 @@ pub struct MethodCallExpression {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ConstructorExpression {
-    pub type_name: Path,
+    pub typ: UnresolvedType,
     pub fields: Vec<(Ident, Expression)>,
-
-    /// This may be filled out during macro expansion
-    /// so that we can skip re-resolving the type name since it
-    /// would be lost at that point.
-    pub struct_type: Option<StructId>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -543,22 +557,65 @@ pub struct IndexExpression {
     pub index: Expression, // XXX: We accept two types of indices, either a normal integer or a constant
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct BlockExpression {
     pub statements: Vec<Statement>,
 }
 
 impl BlockExpression {
-    pub fn pop(&mut self) -> Option<StatementKind> {
-        self.statements.pop().map(|stmt| stmt.kind)
-    }
-
-    pub fn len(&self) -> usize {
-        self.statements.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.statements.is_empty()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ConstrainExpression {
+    pub kind: ConstrainKind,
+    pub arguments: Vec<Expression>,
+    pub location: Location,
+}
+
+impl Display for ConstrainExpression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            ConstrainKind::Assert | ConstrainKind::AssertEq => write!(
+                f,
+                "{}({})",
+                self.kind,
+                vecmap(&self.arguments, |arg| arg.to_string()).join(", ")
+            ),
+            ConstrainKind::Constrain => {
+                write!(f, "constrain {}", &self.arguments[0])
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ConstrainKind {
+    Assert,
+    AssertEq,
+    Constrain,
+}
+
+impl ConstrainKind {
+    /// The number of arguments expected by the constraint,
+    /// not counting the optional assertion message.
+    pub fn required_arguments_count(&self) -> usize {
+        match self {
+            ConstrainKind::Assert | ConstrainKind::Constrain => 1,
+            ConstrainKind::AssertEq => 2,
+        }
+    }
+}
+
+impl Display for ConstrainKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConstrainKind::Assert => write!(f, "assert"),
+            ConstrainKind::AssertEq => write!(f, "assert_eq"),
+            ConstrainKind::Constrain => write!(f, "constrain"),
+        }
     }
 }
 
@@ -578,26 +635,37 @@ impl Display for ExpressionKind {
             Index(index) => index.fmt(f),
             Call(call) => call.fmt(f),
             MethodCall(call) => call.fmt(f),
+            Constrain(constrain) => constrain.fmt(f),
             Cast(cast) => cast.fmt(f),
             Infix(infix) => infix.fmt(f),
             If(if_expr) => if_expr.fmt(f),
+            Match(match_expr) => match_expr.fmt(f),
             Variable(path) => path.fmt(f),
             Constructor(constructor) => constructor.fmt(f),
             MemberAccess(access) => access.fmt(f),
             Tuple(elements) => {
                 let elements = vecmap(elements, ToString::to_string);
-                write!(f, "({})", elements.join(", "))
+                if elements.len() == 1 {
+                    write!(f, "({},)", elements[0])
+                } else {
+                    write!(f, "({})", elements.join(", "))
+                }
             }
             Lambda(lambda) => lambda.fmt(f),
             Parenthesized(sub_expr) => write!(f, "({sub_expr})"),
             Comptime(block, _) => write!(f, "comptime {block}"),
+            Unsafe(UnsafeExpression { block, .. }) => write!(f, "unsafe {block}"),
             Error => write!(f, "Error"),
             Resolved(_) => write!(f, "?Resolved"),
+            Interned(_) => write!(f, "?Interned"),
             Unquote(expr) => write!(f, "$({expr})"),
             Quote(tokens) => {
                 let tokens = vecmap(&tokens.0, ToString::to_string);
                 write!(f, "quote {{ {} }}", tokens.join(" "))
             }
+            AsTraitPath(path) => write!(f, "{path}"),
+            TypePath(path) => write!(f, "{path}"),
+            InternedStatement(_) => write!(f, "?InternedStatement"),
         }
     }
 }
@@ -612,28 +680,29 @@ impl Display for Literal {
             Literal::Array(ArrayLiteral::Repeated { repeated_element, length }) => {
                 write!(f, "[{repeated_element}; {length}]")
             }
-            Literal::Slice(ArrayLiteral::Standard(elements)) => {
+            Literal::Vector(ArrayLiteral::Standard(elements)) => {
                 let contents = vecmap(elements, ToString::to_string);
-                write!(f, "&[{}]", contents.join(", "))
+                write!(f, "@[{}]", contents.join(", "))
             }
-            Literal::Slice(ArrayLiteral::Repeated { repeated_element, length }) => {
-                write!(f, "&[{repeated_element}; {length}]")
+            Literal::Vector(ArrayLiteral::Repeated { repeated_element, length }) => {
+                write!(f, "@[{repeated_element}; {length}]")
             }
             Literal::Bool(boolean) => write!(f, "{}", if *boolean { "true" } else { "false" }),
-            Literal::Integer(integer, sign) => {
-                if *sign {
-                    write!(f, "-{}", integer.to_u128())
-                } else {
-                    write!(f, "{}", integer.to_u128())
-                }
-            }
+            Literal::Integer(signed_field, Some(suffix)) => write!(f, "{signed_field}_{suffix}"),
+            Literal::Integer(signed_field, None) => write!(f, "{signed_field}"),
             Literal::Str(string) => write!(f, "\"{string}\""),
             Literal::RawStr(string, num_hashes) => {
                 let hashes: String =
                     std::iter::once('#').cycle().take(*num_hashes as usize).collect();
                 write!(f, "r{hashes}\"{string}\"{hashes}")
             }
-            Literal::FmtStr(string) => write!(f, "f\"{string}\""),
+            Literal::FmtStr(fragments, _length) => {
+                write!(f, "f\"")?;
+                for fragment in fragments {
+                    fragment.fmt(f)?;
+                }
+                write!(f, "\"")
+            }
             Literal::Unit => write!(f, "()"),
         }
     }
@@ -663,7 +732,8 @@ impl Display for UnaryOp {
         match self {
             UnaryOp::Minus => write!(f, "-"),
             UnaryOp::Not => write!(f, "!"),
-            UnaryOp::MutableReference => write!(f, "&mut"),
+            UnaryOp::Reference { mutable } if *mutable => write!(f, "&mut"),
+            UnaryOp::Reference { .. } => write!(f, "&"),
             UnaryOp::Dereference { .. } => write!(f, "*"),
         }
     }
@@ -697,10 +767,9 @@ impl Display for CastExpression {
 
 impl Display for ConstructorExpression {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let fields =
-            self.fields.iter().map(|(ident, expr)| format!("{ident}: {expr}")).collect::<Vec<_>>();
+        let fields = vecmap(&self.fields, |(ident, expr)| format!("{ident}: {expr}"));
 
-        write!(f, "({} {{ {} }})", self.type_name, fields.join(", "))
+        write!(f, "({} {{ {} }})", self.typ, fields.join(", "))
     }
 }
 
@@ -718,24 +787,7 @@ impl Display for InfixExpression {
 
 impl Display for BinaryOpKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BinaryOpKind::Add => write!(f, "+"),
-            BinaryOpKind::Subtract => write!(f, "-"),
-            BinaryOpKind::Multiply => write!(f, "*"),
-            BinaryOpKind::Divide => write!(f, "/"),
-            BinaryOpKind::Equal => write!(f, "=="),
-            BinaryOpKind::NotEqual => write!(f, "!="),
-            BinaryOpKind::Less => write!(f, "<"),
-            BinaryOpKind::LessEqual => write!(f, "<="),
-            BinaryOpKind::Greater => write!(f, ">"),
-            BinaryOpKind::GreaterEqual => write!(f, ">="),
-            BinaryOpKind::And => write!(f, "&"),
-            BinaryOpKind::Or => write!(f, "|"),
-            BinaryOpKind::Xor => write!(f, "^"),
-            BinaryOpKind::ShiftLeft => write!(f, "<<"),
-            BinaryOpKind::ShiftRight => write!(f, ">>"),
-            BinaryOpKind::Modulo => write!(f, "%"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -749,21 +801,56 @@ impl Display for IfExpression {
     }
 }
 
+impl Display for MatchExpression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "match {} {{", self.expression)?;
+        for (pattern, branch) in &self.rules {
+            writeln!(f, "    {pattern} => {branch},")?;
+        }
+        write!(f, "}}")
+    }
+}
+
 impl Display for Lambda {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let parameters = vecmap(&self.parameters, |(name, r#type)| format!("{name}: {type}"));
+        let unconstrained = if self.unconstrained { "unconstrained " } else { "" };
+        let parameters = vecmap(&self.parameters, |(name, r#type)| {
+            if let Some(typ) = r#type { format!("{name}: {typ}") } else { format!("{name}") }
+        });
 
-        write!(f, "|{}| -> {} {{ {} }}", parameters.join(", "), self.return_type, self.body)
+        let parameters = parameters.join(", ");
+        if let Some(return_type) = &self.return_type {
+            write!(f, "{unconstrained}|{}| -> {} {{ {} }}", parameters, return_type, self.body)
+        } else {
+            write!(f, "{unconstrained}|{}| {{ {} }}", parameters, self.body)
+        }
+    }
+}
+
+impl Display for AsTraitPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} as {}>::{}", self.typ, self.trait_path, self.impl_item)
+    }
+}
+
+impl Display for TypePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}::{}", self.typ, self.item)?;
+        if let Some(turbofish) = &self.turbofish {
+            write!(f, "::{turbofish}")?;
+        }
+        Ok(())
     }
 }
 
 impl FunctionDefinition {
     pub fn normal(
         name: &Ident,
+        is_unconstrained: bool,
         generics: &UnresolvedGenerics,
         parameters: &[(Ident, UnresolvedType)],
-        body: &BlockExpression,
-        where_clause: &[UnresolvedTraitConstraint],
+        body: BlockExpression,
+        where_clause: Vec<UnresolvedTraitConstraint>,
         return_type: &FunctionReturnType,
     ) -> FunctionDefinition {
         let p = parameters
@@ -772,34 +859,35 @@ impl FunctionDefinition {
                 visibility: Visibility::Private,
                 pattern: Pattern::Identifier(ident.clone()),
                 typ: unresolved_type.clone(),
-                span: ident.span().merge(unresolved_type.span.unwrap()),
+                location: ident.location().merge(unresolved_type.location),
             })
             .collect();
 
         FunctionDefinition {
             name: name.clone(),
             attributes: Attributes::empty(),
-            is_unconstrained: false,
+            is_unconstrained,
             is_comptime: false,
             visibility: ItemVisibility::Private,
             generics: generics.clone(),
             parameters: p,
-            body: body.clone(),
-            span: name.span(),
-            where_clause: where_clause.to_vec(),
+            body,
+            location: name.location(),
+            where_clause,
             return_type: return_type.clone(),
             return_visibility: Visibility::Private,
         }
     }
 
     pub fn signature(&self) -> String {
-        let parameters = vecmap(&self.parameters, |Param { visibility, pattern, typ, span: _ }| {
-            if *visibility == Visibility::Public {
-                format!("{pattern}: {visibility} {typ}")
-            } else {
-                format!("{pattern}: {typ}")
-            }
-        });
+        let parameters =
+            vecmap(&self.parameters, |Param { visibility, pattern, typ, location: _ }| {
+                if *visibility == Visibility::Public {
+                    format!("{pattern}: {visibility} {typ}")
+                } else {
+                    format!("{pattern}: {typ}")
+                }
+            });
 
         let where_clause = vecmap(&self.where_clause, ToString::to_string);
         let where_clause_str = if !where_clause.is_empty() {
@@ -821,17 +909,24 @@ impl FunctionDefinition {
 impl Display for FunctionDefinition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{:?}", self.attributes)?;
-        write!(f, "fn {} {}", self.signature(), self.body)
+        write!(f, "{} {}", self.signature(), self.body)
     }
 }
 
 impl FunctionReturnType {
     pub fn get_type(&self) -> Cow<UnresolvedType> {
         match self {
-            FunctionReturnType::Default(span) => {
-                Cow::Owned(UnresolvedType { typ: UnresolvedTypeData::Unit, span: Some(*span) })
+            FunctionReturnType::Default(location) => {
+                Cow::Owned(UnresolvedType { typ: UnresolvedTypeData::Unit, location: *location })
             }
             FunctionReturnType::Ty(typ) => Cow::Borrowed(typ),
+        }
+    }
+
+    pub fn location(&self) -> Location {
+        match self {
+            FunctionReturnType::Default(location) => *location,
+            FunctionReturnType::Ty(typ) => typ.location,
         }
     }
 }

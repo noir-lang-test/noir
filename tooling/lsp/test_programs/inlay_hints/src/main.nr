@@ -92,3 +92,48 @@ fn call_yet_another_function() {
     yet_another_function(some_name) // Should not show parameter names ("name" is a suffix of "some_name")
 }
 
+fn struct_member_hint() {
+    let SomeStruct { one } = SomeStruct { one: 1 };
+}
+
+fn some_map<T, U>(x: T, f: fn(T) -> U) -> U {
+    f(x)
+}
+
+fn hint_on_lambda_parameter() {
+    let value: i32 = 1;
+    let _: i32 = some_map(value, |x| x + 1);
+}
+
+trait SomeTrait {
+
+}
+
+impl SomeTrait for SomeStruct {
+
+}
+
+mod some_module {
+
+}
+
+contract some_contract {
+
+}}
+
+use std::ops::Not;
+pub fn chain() {
+    let _ = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        .map(|x| x + 123456789012345)
+        .any(|x| x > 5)
+        .not();
+}
+
+fn fn_no_env_no_return() {
+    let _ = || {};
+}
+
+fn fn_env_and_return() {
+    let x: i32 = 1;
+    let _ = || { x };
+}

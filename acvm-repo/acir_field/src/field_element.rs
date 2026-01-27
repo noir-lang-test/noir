@@ -1,5 +1,6 @@
 use ark_ff::PrimeField;
 use ark_ff::Zero;
+use ark_std::io::Write;
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -7,9 +8,13 @@ use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 
 use crate::AcirField;
 
-// XXX: Switch out for a trait and proper implementations
-// This implementation is in-efficient, can definitely remove hex usage and Iterator instances for trivial functionality
-#[derive(Default, Clone, Copy, Eq, PartialOrd, Ord)]
+/// The value 2^127, which represents the boundary between positive and negative
+/// values in i128 representation. Values greater this are treated as negative when
+/// converting to signed integers.
+const I128_SIGN_BOUNDARY: u128 = 1_u128 << 127;
+
+// XXX: Include a trait-based design with field-specific implementations.
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldElement<F: PrimeField>(F);
 
 impl<F: PrimeField> std::fmt::Display for FieldElement<F> {
@@ -33,46 +38,6 @@ impl<F: PrimeField> std::fmt::Display for FieldElement<F> {
             write!(f, "-")?;
         }
 
-        // Number of bits needed to represent the smaller representation
-        let num_bits = smaller_repr.bits();
-
-        // Check if the number represents a power of 2
-        if smaller_repr.count_ones() == 1 {
-            let mut bit_index = 0;
-            for i in 0..num_bits {
-                if smaller_repr.bit(i) {
-                    bit_index = i;
-                    break;
-                }
-            }
-            return match bit_index {
-                0 => write!(f, "1"),
-                1 => write!(f, "2"),
-                2 => write!(f, "4"),
-                3 => write!(f, "8"),
-                _ => write!(f, "2{}", superscript(bit_index)),
-            };
-        }
-
-        // Check if number is a multiple of a power of 2.
-        // This is used because when computing the quotient
-        // we usually have numbers in the form 2^t * q + r
-        // We focus on 2^64, 2^32, 2^16, 2^8, 2^4 because
-        // they are common. We could extend this to a more
-        // general factorization strategy, but we pay in terms of CPU time
-        let mul_sign = "×";
-        for power in [64, 32, 16, 8, 4] {
-            let power_of_two = BigUint::from(2_u128).pow(power);
-            if &smaller_repr % &power_of_two == BigUint::zero() {
-                return write!(
-                    f,
-                    "2{}{}{}",
-                    superscript(power as u64),
-                    mul_sign,
-                    smaller_repr / &power_of_two,
-                );
-            }
-        }
         write!(f, "{smaller_repr}")
     }
 }
@@ -83,99 +48,101 @@ impl<F: PrimeField> std::fmt::Debug for FieldElement<F> {
     }
 }
 
-impl<F: PrimeField> std::hash::Hash for FieldElement<F> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write(&self.to_be_bytes());
-    }
-}
-
-impl<F: PrimeField> PartialEq for FieldElement<F> {
-    fn eq(&self, other: &Self) -> bool {
-        self.to_be_bytes() == other.to_be_bytes()
-    }
-}
-
 impl<F: PrimeField> From<i128> for FieldElement<F> {
-    fn from(mut a: i128) -> FieldElement<F> {
-        let mut negative = false;
-        if a < 0 {
-            a = -a;
-            negative = true;
+    fn from(a: i128) -> FieldElement<F> {
+        // Optimized: Convert directly without string conversion
+        if a >= 0 {
+            // Positive case: convert via u128
+            FieldElement(F::from(a as u128))
+        } else {
+            // Negative case: handle i128::MIN specially to avoid overflow
+            let abs_value = a.wrapping_neg() as u128;
+            FieldElement(-F::from(abs_value))
         }
-
-        let mut result = match F::from_str(&a.to_string()) {
-            Ok(result) => result,
-            Err(_) => panic!("Cannot convert i128 as a string to a field element"),
-        };
-
-        if negative {
-            result = -result;
-        }
-        FieldElement(result)
     }
 }
 
-impl<T: ark_ff::PrimeField> Serialize for FieldElement<T> {
+impl<T: PrimeField> Serialize for FieldElement<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        self.to_hex().serialize(serializer)
+        self.to_be_bytes().serialize(serializer)
     }
 }
 
-impl<'de, T: ark_ff::PrimeField> Deserialize<'de> for FieldElement<T> {
+impl<'de, T: PrimeField> Deserialize<'de> for FieldElement<T> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let s: Cow<'de, str> = Deserialize::deserialize(deserializer)?;
-        match Self::from_hex(&s) {
-            Some(value) => Ok(value),
-            None => Err(serde::de::Error::custom(format!("Invalid hex for FieldElement: {s}",))),
-        }
+        let s: Cow<'de, [u8]> = Deserialize::deserialize(deserializer)?;
+        Ok(Self::from_be_bytes_reduce(&s))
     }
 }
 
 impl<F: PrimeField> From<u128> for FieldElement<F> {
     fn from(a: u128) -> FieldElement<F> {
-        let result = match F::from_str(&a.to_string()) {
-            Ok(result) => result,
-            Err(_) => panic!("Cannot convert u128 as a string to a field element"),
-        };
-        FieldElement(result)
+        FieldElement(F::from(a))
     }
 }
 
 impl<F: PrimeField> From<usize> for FieldElement<F> {
     fn from(a: usize) -> FieldElement<F> {
-        FieldElement::from(a as u128)
+        FieldElement::from(a as u64)
+    }
+}
+
+impl<F: PrimeField> From<u64> for FieldElement<F> {
+    fn from(a: u64) -> FieldElement<F> {
+        FieldElement(F::from(a))
+    }
+}
+
+impl<F: PrimeField> From<u32> for FieldElement<F> {
+    fn from(a: u32) -> FieldElement<F> {
+        FieldElement(F::from(a))
     }
 }
 
 impl<F: PrimeField> From<bool> for FieldElement<F> {
     fn from(boolean: bool) -> FieldElement<F> {
-        if boolean {
-            FieldElement::one()
-        } else {
-            FieldElement::zero()
-        }
+        if boolean { FieldElement::one() } else { FieldElement::zero() }
     }
 }
 
 impl<F: PrimeField> FieldElement<F> {
+    /// Constructs a `FieldElement` from the underlying prime field representation.
+    ///
+    /// This wraps an `ark_ff::PrimeField` element into a `FieldElement`.
     pub fn from_repr(field: F) -> Self {
         Self(field)
     }
 
-    // XXX: This method is used while this field element
-    // implementation is not generic.
+    /// Extracts the underlying prime field representation.
+    ///
+    /// This returns the wrapped `ark_ff::PrimeField` element.
     pub fn into_repr(self) -> F {
         self.0
     }
 
-    fn fits_in_u128(&self) -> bool {
+    /// Returns true if this field element can be represented as a u128.
+    ///
+    /// A field element fits in u128 if it requires at most 128 bits to represent,
+    /// i.e., if its value is in the range [0, 2^128 - 1].
+    pub fn fits_in_u128(&self) -> bool {
         self.num_bits() <= 128
+    }
+
+    /// Returns true if this field element can be represented as an i128.
+    ///
+    /// An i128 can represent values in the range [i128::MIN, i128::MAX], which corresponds
+    /// to field elements in [0, 2^127 - 1] (positive) and [p - 2^127, p - 1] (negative),
+    /// where p is the field modulus. Note that 2^127 itself cannot be represented as i128
+    /// since it is not in the negative range.
+    pub fn fits_in_i128(&self) -> bool {
+        let num_bits = u32::min(self.neg().num_bits(), self.num_bits());
+        num_bits <= 127 && self != &FieldElement::from(I128_SIGN_BOUNDARY)
     }
 
     /// Returns None, if the string is not a canonical
@@ -191,21 +158,27 @@ impl<F: PrimeField> FieldElement<F> {
         Some(FieldElement(fr))
     }
 
-    fn bits(&self) -> Vec<bool> {
-        fn byte_to_bit(byte: u8) -> Vec<bool> {
-            let mut bits = Vec::with_capacity(8);
-            for index in (0..=7).rev() {
-                bits.push((byte & (1 << index)) >> index == 1);
-            }
-            bits
+    /// Assume this field element holds a signed integer of the given `bit_size` and format
+    /// it as a string. The range of valid values for this field element is `0..2^bit_size`
+    /// with `0..2^(bit_size - 1)` representing positive values and `2^(bit_size - 1)..2^bit_size`
+    /// representing negative values (as is commonly done for signed integers).
+    /// `2^(bit_size - 1)` is the lowest negative value, so for example if bit_size is 8 then
+    /// `0..127` map to `0..127`, `128` maps to `-128`, `129` maps to `-127` and `255` maps to `-1`.
+    /// If `self` falls outside of the valid range it's formatted as-is.
+    pub fn to_string_as_signed_integer(self, bit_size: u32) -> String {
+        assert!(bit_size <= 128);
+        if self.num_bits() > bit_size {
+            return self.to_string();
         }
 
-        let bytes = self.to_be_bytes();
-        let mut bits = Vec::with_capacity(bytes.len() * 8);
-        for byte in bytes {
-            bits.extend(byte_to_bit(byte));
+        // Compute the maximum value that is considered a positive value
+        let max = if bit_size == 128 { i128::MAX as u128 } else { (1 << (bit_size - 1)) - 1 };
+        if self.to_u128() > max {
+            let f = FieldElement::from(2u32).pow(&bit_size.into()) - self;
+            format!("-{f}")
+        } else {
+            self.to_string()
         }
-        bits
     }
 }
 
@@ -243,11 +216,7 @@ impl<F: PrimeField> AcirField for FieldElement<F> {
     /// For example, a max bit size of 254 would give a max byte size of 32.
     fn max_num_bytes() -> u32 {
         let num_bytes = Self::max_num_bits() / 8;
-        if Self::max_num_bits() % 8 == 0 {
-            num_bytes
-        } else {
-            num_bytes + 1
-        }
+        if Self::max_num_bits() % 8 == 0 { num_bytes } else { num_bytes + 1 }
     }
 
     fn modulus() -> BigUint {
@@ -256,17 +225,25 @@ impl<F: PrimeField> AcirField for FieldElement<F> {
 
     /// This is the number of bits required to represent this specific field element
     fn num_bits(&self) -> u32 {
-        let bits = self.bits();
-        // Iterate the number of bits and pop off all leading zeroes
-        let iter = bits.iter().skip_while(|x| !(**x));
-        // Note: count will panic if it goes over usize::MAX.
-        // This may not be suitable for devices whose usize < u16
-        iter.count() as u32
+        let mut bit_counter = BitCounter::default();
+        self.0.serialize_uncompressed(&mut bit_counter).unwrap();
+        bit_counter.bits()
     }
 
     fn to_u128(self) -> u128 {
-        let bytes = self.to_be_bytes();
-        u128::from_be_bytes(bytes[16..32].try_into().unwrap())
+        if !self.fits_in_u128() {
+            panic!("field element too large for u128");
+        }
+        let as_bigint = self.0.into_bigint();
+        let limbs = as_bigint.as_ref();
+
+        let mut result = u128::from(limbs[0]);
+        if limbs.len() > 1 {
+            let high_limb = u128::from(limbs[1]);
+            result += high_limb << 64;
+        }
+
+        result
     }
 
     fn try_into_u128(self) -> Option<u128> {
@@ -274,12 +251,23 @@ impl<F: PrimeField> AcirField for FieldElement<F> {
     }
 
     fn to_i128(self) -> i128 {
-        // Negative integers are represented by the range [p + i128::MIN, p) whilst
+        if !self.fits_in_i128() {
+            panic!("field element too large for i128");
+        }
+        // Negative integers are represented by the range [p + i128::MIN, p) while
         // positive integers are represented by the range [0, i128::MAX).
         // We can then differentiate positive from negative values by their MSB.
-        let is_negative = self.neg().num_bits() < self.num_bits();
-        let bytes = if is_negative { self.neg() } else { self }.to_be_bytes();
-        i128::from_be_bytes(bytes[16..32].try_into().unwrap()) * if is_negative { -1 } else { 1 }
+        if self.neg().num_bits() < self.num_bits() {
+            let bytes = self.neg().to_be_bytes();
+            i128::from_be_bytes(bytes[16..32].try_into().unwrap()).neg()
+        } else {
+            let bytes = self.to_be_bytes();
+            i128::from_be_bytes(bytes[16..32].try_into().unwrap())
+        }
+    }
+
+    fn try_into_i128(self) -> Option<i128> {
+        self.fits_in_i128().then(|| self.to_i128())
     }
 
     fn try_to_u64(&self) -> Option<u64> {
@@ -298,27 +286,72 @@ impl<F: PrimeField> AcirField for FieldElement<F> {
     }
 
     fn to_hex(self) -> String {
-        let mut bytes = Vec::new();
-        self.0.serialize_uncompressed(&mut bytes).unwrap();
-        bytes.reverse();
+        let bytes = self.to_be_bytes();
         hex::encode(bytes)
     }
+
+    fn to_short_hex(self) -> String {
+        if self.is_zero() {
+            return "0x00".to_owned();
+        }
+
+        // Work directly with bytes
+        let bytes = self.to_be_bytes();
+
+        // Find the first non-zero byte
+        let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+        let trimmed = &bytes[first_nonzero..];
+
+        // Build the hex string directly
+        // Pre-allocate: "0x" + at least 2 chars per byte
+        let mut result = String::with_capacity(2 + trimmed.len() * 2);
+        result.push_str("0x");
+
+        // Format the first byte - use {:x} to avoid leading zero if byte >= 0x10
+        use std::fmt::Write;
+        write!(&mut result, "{:x}", trimmed[0]).unwrap();
+
+        // Ensure even length by padding if necessary
+        if result.len() % 2 != 0 {
+            // Insert '0' after "0x" to make it even
+            result.insert(2, '0');
+        }
+
+        // Format remaining bytes with padding
+        for byte in &trimmed[1..] {
+            write!(&mut result, "{byte:02x}").unwrap();
+        }
+
+        result
+    }
+
     fn from_hex(hex_str: &str) -> Option<FieldElement<F>> {
         let value = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-        // Values of odd length require an additional "0" prefix
-        let sanitized_value =
-            if value.len() % 2 == 0 { value.to_string() } else { format!("0{}", value) };
-        let hex_as_bytes = hex::decode(sanitized_value).ok()?;
+
+        // Decode directly, handling even length efficiently
+        let hex_as_bytes = if value.len() % 2 == 0 {
+            hex::decode(value).ok()?
+        } else {
+            // For odd length, prepend '0' to the string view only for decoding
+            let mut padded = String::with_capacity(value.len() + 1);
+            padded.push('0');
+            padded.push_str(value);
+            hex::decode(padded).ok()?
+        };
+
         Some(FieldElement::from_be_bytes_reduce(&hex_as_bytes))
     }
 
     fn to_be_bytes(self) -> Vec<u8> {
-        // to_be_bytes! uses little endian which is why we reverse the output
-        // TODO: Add a little endian equivalent, so the caller can use whichever one
-        // TODO they desire
+        let mut bytes = self.to_le_bytes();
+        bytes.reverse();
+        bytes
+    }
+
+    /// Converts the field element to a vector of bytes in little-endian order
+    fn to_le_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::new();
         self.0.serialize_uncompressed(&mut bytes).unwrap();
-        bytes.reverse();
         bytes
     }
 
@@ -328,18 +361,23 @@ impl<F: PrimeField> AcirField for FieldElement<F> {
         FieldElement(F::from_be_bytes_mod_order(bytes))
     }
 
+    /// Converts bytes in little-endian order into a FieldElement and applies a
+    /// reduction if needed.
+    fn from_le_bytes_reduce(bytes: &[u8]) -> FieldElement<F> {
+        FieldElement(F::from_le_bytes_mod_order(bytes))
+    }
+
     /// Returns the closest number of bytes to the bits specified
     /// This method truncates
     fn fetch_nearest_bytes(&self, num_bits: usize) -> Vec<u8> {
         fn nearest_bytes(num_bits: usize) -> usize {
-            ((num_bits + 7) / 8) * 8
+            num_bits.div_ceil(8) * 8
         }
 
         let num_bytes = nearest_bytes(num_bits);
         let num_elements = num_bytes / 8;
 
-        let mut bytes = self.to_be_bytes();
-        bytes.reverse(); // put it in big endian format. XXX(next refactor): we should be explicit about endianness.
+        let bytes = self.to_le_bytes();
 
         bytes[0..num_elements].to_vec()
     }
@@ -370,7 +408,7 @@ impl<F: PrimeField> Div for FieldElement<F> {
 impl<F: PrimeField> Add for FieldElement<F> {
     type Output = FieldElement<F>;
     fn add(mut self, rhs: FieldElement<F>) -> Self::Output {
-        self.0.add_assign(&rhs.0);
+        self.add_assign(rhs);
         FieldElement(self.0)
     }
 }
@@ -383,7 +421,7 @@ impl<F: PrimeField> AddAssign for FieldElement<F> {
 impl<F: PrimeField> Sub for FieldElement<F> {
     type Output = FieldElement<F>;
     fn sub(mut self, rhs: FieldElement<F>) -> Self::Output {
-        self.0.sub_assign(&rhs.0);
+        self.sub_assign(rhs);
         FieldElement(self.0)
     }
 }
@@ -393,32 +431,49 @@ impl<F: PrimeField> SubAssign for FieldElement<F> {
     }
 }
 
-// For pretty printing powers
-fn superscript(n: u64) -> String {
-    if n == 0 {
-        "⁰".to_owned()
-    } else if n == 1 {
-        "¹".to_owned()
-    } else if n == 2 {
-        "²".to_owned()
-    } else if n == 3 {
-        "³".to_owned()
-    } else if n == 4 {
-        "⁴".to_owned()
-    } else if n == 5 {
-        "⁵".to_owned()
-    } else if n == 6 {
-        "⁶".to_owned()
-    } else if n == 7 {
-        "⁷".to_owned()
-    } else if n == 8 {
-        "⁸".to_owned()
-    } else if n == 9 {
-        "⁹".to_owned()
-    } else if n >= 10 {
-        superscript(n / 10) + &superscript(n % 10)
-    } else {
-        panic!("{}", n.to_string() + " can't be converted to superscript.");
+#[derive(Default, Debug)]
+struct BitCounter {
+    /// Total number of non-zero bytes we found.
+    count: usize,
+    /// Total bytes we found.
+    total: usize,
+    /// The last non-zero byte we found.
+    head_byte: u8,
+}
+
+impl BitCounter {
+    fn bits(&self) -> u32 {
+        // If we don't have a non-zero byte then the field element is zero,
+        // which we consider to require a zero bits to represent.
+        if self.count == 0 {
+            return 0;
+        }
+
+        let num_bits_for_head_byte = self.head_byte.ilog2();
+
+        // Each remaining byte in the byte decomposition requires 8 bits.
+        //
+        // Note: count will panic if it goes over usize::MAX.
+        // This may not be suitable for devices whose usize < u16
+        let tail_length = (self.count - 1) as u32;
+        8 * tail_length + num_bits_for_head_byte + 1
+    }
+}
+
+impl Write for BitCounter {
+    fn write(&mut self, buf: &[u8]) -> ark_std::io::Result<usize> {
+        for byte in buf {
+            self.total += 1;
+            if *byte != 0 {
+                self.count = self.total;
+                self.head_byte = *byte;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> ark_std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -426,6 +481,205 @@ fn superscript(n: u64) -> String {
 mod tests {
     use super::{AcirField, FieldElement};
     use proptest::prelude::*;
+    use std::ops::Neg;
+
+    #[test]
+    fn requires_zero_bit_to_hold_zero() {
+        let field = FieldElement::<ark_bn254::Fr>::zero();
+        assert_eq!(field.num_bits(), 0);
+    }
+
+    #[test]
+    fn requires_one_bit_to_hold_one() {
+        let field = FieldElement::<ark_bn254::Fr>::one();
+        assert_eq!(field.num_bits(), 1);
+    }
+
+    proptest! {
+        #[test]
+        fn num_bits_agrees_with_ilog2(num in 1u128..) {
+            let field = FieldElement::<ark_bn254::Fr>::from(num);
+            prop_assert_eq!(field.num_bits(), num.ilog2() + 1);
+        }
+    }
+
+    #[test]
+    fn test_fits_in_u128() {
+        let field = FieldElement::<ark_bn254::Fr>::from(u128::MAX);
+        assert_eq!(field.num_bits(), 128);
+        assert!(field.fits_in_u128());
+        let big_field = field + FieldElement::one();
+        assert_eq!(big_field.num_bits(), 129);
+        assert!(!big_field.fits_in_u128());
+    }
+
+    #[test]
+    fn test_to_u128_basic() {
+        type F = FieldElement<ark_bn254::Fr>;
+
+        // Test zero
+        assert_eq!(F::zero().to_u128(), 0);
+
+        // Test small values
+        assert_eq!(F::from(1_u128).to_u128(), 1);
+        assert_eq!(F::from(42_u128).to_u128(), 42);
+        assert_eq!(F::from(1000_u128).to_u128(), 1000);
+
+        // Test u128::MAX
+        assert_eq!(F::from(u128::MAX).to_u128(), u128::MAX);
+
+        // Test power of 2 boundaries
+        assert_eq!(F::from(1_u128 << 127).to_u128(), 1_u128 << 127);
+        assert_eq!(F::from((1_u128 << 127) - 1).to_u128(), (1_u128 << 127) - 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "field element too large for u128")]
+    fn test_to_u128_panics_on_overflow() {
+        type F = FieldElement<ark_bn254::Fr>;
+
+        // Create a field element larger than u128::MAX
+        let too_large = F::from(u128::MAX) + F::one();
+        too_large.to_u128(); // Should panic
+    }
+
+    #[test]
+    fn test_try_into_u128() {
+        type F = FieldElement<ark_bn254::Fr>;
+
+        // Valid conversions
+        assert_eq!(F::zero().try_into_u128(), Some(0));
+        assert_eq!(F::from(42_u128).try_into_u128(), Some(42));
+        assert_eq!(F::from(u128::MAX).try_into_u128(), Some(u128::MAX));
+
+        // Invalid conversion
+        let too_large = F::from(u128::MAX) + F::one();
+        assert_eq!(too_large.try_into_u128(), None);
+    }
+
+    #[test]
+    fn test_fits_in_i128() {
+        type F = FieldElement<ark_bn254::Fr>;
+
+        // Positive values that fit
+        assert!(F::zero().fits_in_i128());
+        assert!(F::from(1_i128).fits_in_i128());
+        assert!(F::from(42_i128).fits_in_i128());
+        assert!(F::from(i128::MAX).fits_in_i128());
+
+        // Negative values that fit (except i128::MIN)
+        assert!(F::from(-1_i128).fits_in_i128());
+        assert!(F::from(-42_i128).fits_in_i128());
+        assert!(F::from(i128::MIN + 1).fits_in_i128());
+
+        // Boundary: 2^127 - 1 fits (i128::MAX)
+        assert!(F::from((1_u128 << 127) - 1).fits_in_i128());
+
+        // Boundary: 2^127 does NOT fit (exceeds i128::MAX, not negative)
+        // Note: This also means i128::MIN doesn't fit, as it converts to a field element
+        // that when interpreted as unsigned equals 2^127
+        assert!(!F::from(1_u128 << 127).fits_in_i128());
+        assert!(!F::from(i128::MIN).fits_in_i128());
+
+        // Values that don't fit
+        let too_large = F::from(u128::MAX);
+        assert!(!too_large.fits_in_i128());
+    }
+
+    #[test]
+    fn test_to_i128_positive() {
+        type F = FieldElement<ark_bn254::Fr>;
+
+        // Test positive values
+        assert_eq!(F::zero().to_i128(), 0);
+        assert_eq!(F::from(1_i128).to_i128(), 1);
+        assert_eq!(F::from(42_i128).to_i128(), 42);
+        assert_eq!(F::from(1000_i128).to_i128(), 1000);
+        assert_eq!(F::from(i128::MAX).to_i128(), i128::MAX);
+    }
+
+    #[test]
+    fn test_to_i128_negative() {
+        type F = FieldElement<ark_bn254::Fr>;
+
+        // Test negative values
+        assert_eq!(F::from(-1_i128).to_i128(), -1);
+        assert_eq!(F::from(-42_i128).to_i128(), -42);
+        assert_eq!(F::from(-1000_i128).to_i128(), -1000);
+
+        // Test boundary values
+        assert_eq!(F::from(-i128::MAX).to_i128(), -i128::MAX);
+        assert_eq!(F::from(i128::MIN + 1).to_i128(), i128::MIN + 1);
+
+        // i128::MIN doesn't fit
+    }
+
+    #[test]
+    fn test_to_i128_roundtrip() {
+        type F = FieldElement<ark_bn254::Fr>;
+
+        // Test roundtrip for various values
+        // i128::MIN doesn't fit
+        let test_values =
+            vec![0_i128, 1, -1, 42, -42, i128::MAX, i128::MAX - 1, i128::MIN + 1, -i128::MAX];
+
+        for value in test_values {
+            let field = F::from(value);
+            assert!(field.fits_in_i128(), "Value {value} should fit in i128");
+            assert_eq!(field.to_i128(), value, "Roundtrip failed for {value}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "field element too large for i128")]
+    fn test_to_i128_panics_on_positive_overflow() {
+        type F = FieldElement<ark_bn254::Fr>;
+
+        // 2^127 is too large (exceeds i128::MAX)
+        let too_large = F::from(1_u128 << 127);
+        too_large.to_i128(); // Should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "field element too large for i128")]
+    fn test_to_i128_panics_on_large_value() {
+        type F = FieldElement<ark_bn254::Fr>;
+
+        // Large positive value that doesn't fit
+        let too_large = F::from(u128::MAX);
+        too_large.to_i128(); // Should panic
+    }
+
+    #[test]
+    fn test_try_into_i128() {
+        type F = FieldElement<ark_bn254::Fr>;
+
+        // Valid positive conversions
+        assert_eq!(F::zero().try_into_i128(), Some(0));
+        assert_eq!(F::from(42_i128).try_into_i128(), Some(42));
+        assert_eq!(F::from(i128::MAX).try_into_i128(), Some(i128::MAX));
+        assert_eq!(F::from(-i128::MAX).try_into_i128(), Some(-i128::MAX));
+
+        // Valid negative conversions
+        assert_eq!(F::from(-1_i128).try_into_i128(), Some(-1));
+        assert_eq!(F::from(-42_i128).try_into_i128(), Some(-42));
+        assert_eq!(F::from(i128::MIN + 1).try_into_i128(), Some(i128::MIN + 1));
+        assert_eq!(F::from(i128::MAX - 1).try_into_i128(), Some(i128::MAX - 1));
+        assert_eq!(F::from(1_i128 << 126).try_into_i128(), Some(1_i128 << 126));
+        assert_eq!(F::from(-((1_i128 << 126) - 1)).try_into_i128(), Some(-((1_i128 << 126) - 1)));
+        // Invalid conversions
+        assert_eq!(F::from(1_u128 << 127).try_into_i128(), None);
+        assert_eq!(F::from(u128::MAX).try_into_i128(), None);
+        // i128::MIN doesn't fit due to implementation
+        assert_eq!(F::from(i128::MIN).try_into_i128(), None);
+        // A few other invalid values
+        assert_eq!(F::from((1_u128 << 127) + 1).try_into_i128(), None);
+        assert_eq!(F::from((1_u128 << 127) + 1000).try_into_i128(), None);
+        assert_eq!(F::from(1_u128 << 127).neg().try_into_i128(), None);
+        assert_eq!(F::from((1_u128 << 127) + 1).neg().try_into_i128(), None);
+        assert_eq!(F::from((1_u128 << 127) + 100).try_into_i128(), None);
+        assert_eq!(F::from((1_u128 << 127) + 100).neg().try_into_i128(), None);
+    }
 
     #[test]
     fn serialize_fixed_test_vectors() {
@@ -447,6 +701,50 @@ mod tests {
     fn max_num_bits_smoke() {
         let max_num_bits_bn254 = FieldElement::<ark_bn254::Fr>::max_num_bits();
         assert_eq!(max_num_bits_bn254, 254);
+    }
+
+    proptest! {
+        #[test]
+        fn test_endianness_prop(value in any::<u64>()) {
+            let field = FieldElement::<ark_bn254::Fr>::from(value);
+            // Test serialization consistency
+            let le_bytes = field.to_le_bytes();
+            let be_bytes = field.to_be_bytes();
+
+            let mut reversed_le = le_bytes.clone();
+            reversed_le.reverse();
+            prop_assert_eq!(&be_bytes, &reversed_le, "BE bytes should be reverse of LE bytes");
+
+            // Test deserialization consistency
+            let from_le = FieldElement::from_le_bytes_reduce(&le_bytes);
+            let from_be = FieldElement::from_be_bytes_reduce(&be_bytes);
+            prop_assert_eq!(from_le, from_be, "Deserialization should be consistent between LE and BE");
+            prop_assert_eq!(from_le, field, "Deserialized value should match original");
+        }
+    }
+
+    #[test]
+    fn test_endianness() {
+        let field = FieldElement::<ark_bn254::Fr>::from(0x1234_5678_u32);
+        let le_bytes = field.to_le_bytes();
+        let be_bytes = field.to_be_bytes();
+
+        // Check that the bytes are reversed between BE and LE
+        let mut reversed_le = le_bytes.clone();
+        reversed_le.reverse();
+        assert_eq!(&be_bytes, &reversed_le);
+
+        // Verify we can reconstruct the same field element from either byte order
+        let from_le = FieldElement::from_le_bytes_reduce(&le_bytes);
+        let from_be = FieldElement::from_be_bytes_reduce(&be_bytes);
+        assert_eq!(from_le, from_be);
+        assert_eq!(from_le, field);
+
+        // Additional test with a larger number to ensure proper byte handling
+        let large_field = FieldElement::<ark_bn254::Fr>::from(0x0123_4567_89AB_CDEF_u64); // cSpell:disable-line
+        let large_le = large_field.to_le_bytes();
+        let reconstructed = FieldElement::from_le_bytes_reduce(&large_le);
+        assert_eq!(reconstructed, large_field);
     }
 
     proptest! {
@@ -474,5 +772,49 @@ mod tests {
 
             prop_assert_eq!(fe_1, fe_2, "equivalent hex strings with opposite parity deserialized to different values");
         }
+    }
+
+    #[test]
+    fn test_to_hex() {
+        type F = FieldElement<ark_bn254::Fr>;
+        assert_eq!(
+            F::zero().to_hex(),
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            F::one().to_hex(),
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        );
+        assert_eq!(
+            F::from(0x123_u128).to_hex(),
+            "0000000000000000000000000000000000000000000000000000000000000123"
+        );
+        assert_eq!(
+            F::from(0x1234_u128).to_hex(),
+            "0000000000000000000000000000000000000000000000000000000000001234"
+        );
+    }
+
+    #[test]
+    fn test_to_short_hex() {
+        type F = FieldElement<ark_bn254::Fr>;
+        assert_eq!(F::zero().to_short_hex(), "0x00");
+        assert_eq!(F::one().to_short_hex(), "0x01");
+        assert_eq!(F::from(0x123_u128).to_short_hex(), "0x0123");
+        assert_eq!(F::from(0x1234_u128).to_short_hex(), "0x1234");
+    }
+
+    #[test]
+    fn to_string_as_signed_integer() {
+        type F = FieldElement<ark_bn254::Fr>;
+        assert_eq!(F::zero().to_string_as_signed_integer(8), "0");
+        assert_eq!(F::one().to_string_as_signed_integer(8), "1");
+        assert_eq!(F::from(127_u128).to_string_as_signed_integer(8), "127");
+        assert_eq!(F::from(128_u128).to_string_as_signed_integer(8), "-128");
+        assert_eq!(F::from(129_u128).to_string_as_signed_integer(8), "-127");
+        assert_eq!(F::from(255_u128).to_string_as_signed_integer(8), "-1");
+        assert_eq!(F::from(32767_u128).to_string_as_signed_integer(16), "32767");
+        assert_eq!(F::from(32768_u128).to_string_as_signed_integer(16), "-32768");
+        assert_eq!(F::from(65535_u128).to_string_as_signed_integer(16), "-1");
     }
 }

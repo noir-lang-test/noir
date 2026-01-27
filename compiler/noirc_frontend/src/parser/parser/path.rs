@@ -1,90 +1,363 @@
-use crate::ast::{Path, PathKind, PathSegment};
-use crate::parser::NoirParser;
+use crate::ast::{AsTraitPath, Ident, Path, PathKind, PathSegment, UnresolvedType};
+use crate::parser::ParserErrorReason;
 
 use crate::token::{Keyword, Token};
 
-use chumsky::prelude::*;
+use noirc_errors::Location;
 
-use super::keyword;
-use super::primitives::{path_segment, path_segment_no_turbofish};
+use crate::{parser::labels::ParsingRuleLabel, token::TokenKind};
 
-pub(super) fn path() -> impl NoirParser<Path> {
-    path_inner(path_segment())
-}
+use super::Parser;
 
-pub(super) fn path_no_turbofish() -> impl NoirParser<Path> {
-    path_inner(path_segment_no_turbofish())
-}
+impl Parser<'_> {
+    #[cfg(test)]
+    pub(crate) fn parse_path_or_error(&mut self) -> Path {
+        if let Some(path) = self.parse_path() {
+            path
+        } else {
+            self.expected_label(ParsingRuleLabel::Path);
 
-fn path_inner<'a>(segment: impl NoirParser<PathSegment> + 'a) -> impl NoirParser<Path> + 'a {
-    let segments = segment.separated_by(just(Token::DoubleColon)).at_least(1);
-    let make_path = |kind| move |segments, span| Path { segments, kind, span };
+            Path::plain(Vec::new(), self.location_at_previous_token_end())
+        }
+    }
 
-    let prefix = |key| keyword(key).ignore_then(just(Token::DoubleColon));
-    let path_kind =
-        |key, kind| prefix(key).ignore_then(segments.clone()).map_with_span(make_path(kind));
+    /// Tries to parse a Path.
+    /// Note that `crate::`, `super::`, etc., are not valid paths on their own.
+    ///
+    /// Path = PathKind identifier Turbofish? ( '::' identifier Turbofish? )*
+    ///
+    /// Turbofish = '::' PathGenerics
+    pub(crate) fn parse_path(&mut self) -> Option<Path> {
+        self.parse_path_impl(
+            true, // allow turbofish
+            true, // allow trailing double colon
+        )
+    }
 
-    choice((
-        path_kind(Keyword::Crate, PathKind::Crate),
-        path_kind(Keyword::Dep, PathKind::Dep),
-        path_kind(Keyword::Super, PathKind::Super),
-        segments.map_with_span(make_path(PathKind::Plain)),
-    ))
-}
+    pub(crate) fn parse_path_no_turbofish_or_error(&mut self) -> Path {
+        if let Some(path) = self.parse_path_no_turbofish() {
+            path
+        } else {
+            self.expected_label(ParsingRuleLabel::Path);
 
-fn empty_path() -> impl NoirParser<Path> {
-    let make_path = |kind| move |_, span| Path { segments: Vec::new(), kind, span };
-    let path_kind = |key, kind| keyword(key).map_with_span(make_path(kind));
+            Path::plain(Vec::new(), self.location_at_previous_token_end())
+        }
+    }
 
-    choice((path_kind(Keyword::Crate, PathKind::Crate), path_kind(Keyword::Dep, PathKind::Plain)))
-}
+    /// PathNoTurbofish = PathKind identifier ( '::' identifier )*
+    pub fn parse_path_no_turbofish(&mut self) -> Option<Path> {
+        self.parse_path_impl(
+            false, // allow turbofish
+            true,  // allow trailing double colon
+        )
+    }
 
-pub(super) fn maybe_empty_path() -> impl NoirParser<Path> {
-    path().or(empty_path())
-}
+    pub(super) fn parse_path_impl(
+        &mut self,
+        allow_turbofish: bool,
+        allow_trailing_double_colon: bool,
+    ) -> Option<Path> {
+        let start_location = self.current_token_location;
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::parser::parser::test_helpers::{parse_all_failing, parse_with};
+        let kind = self.parse_path_kind();
 
-    #[test]
-    fn parse_path() {
-        let cases = vec![
-            ("std", vec!["std"]),
-            ("std::hash", vec!["std", "hash"]),
-            ("std::hash::collections", vec!["std", "hash", "collections"]),
-            ("foo::bar", vec!["foo", "bar"]),
-            ("crate::std::hash", vec!["std", "hash"]),
-        ];
+        let path = self.parse_optional_path_after_kind(
+            kind,
+            allow_turbofish,
+            allow_trailing_double_colon,
+            start_location,
+        )?;
+        if path.segments.is_empty() {
+            if path.kind != PathKind::Plain {
+                self.expected_identifier();
+            }
+            None
+        } else {
+            Some(path)
+        }
+    }
 
-        for (src, expected_segments) in cases {
-            let path: Path = parse_with(path(), src).unwrap();
-            for (segment, expected) in path.segments.into_iter().zip(expected_segments) {
-                assert_eq!(segment.ident.0.contents, expected);
+    pub(super) fn parse_optional_path_after_kind(
+        &mut self,
+        kind: PathKind,
+        allow_turbofish: bool,
+        allow_trailing_double_colon: bool,
+        start_location: Location,
+    ) -> Option<Path> {
+        let path = self.parse_path_after_kind(
+            kind,
+            allow_turbofish,
+            allow_trailing_double_colon,
+            start_location,
+        );
+
+        if path.segments.is_empty() && path.kind == PathKind::Plain { None } else { Some(path) }
+    }
+
+    /// Parses a path assuming the path's kind (plain, `crate::`, `super::`, etc.)
+    /// was already parsed. Note that this method always returns a Path, even if it
+    /// ends up being just `crate::` or an empty path.
+    pub(super) fn parse_path_after_kind(
+        &mut self,
+        kind: PathKind,
+        allow_turbofish: bool,
+        allow_trailing_double_colon: bool,
+        start_location: Location,
+    ) -> Path {
+        let mut segments = Vec::new();
+
+        if self.token.kind() == TokenKind::Ident {
+            loop {
+                let ident = self.eat_ident().unwrap();
+                let location = ident.location();
+
+                let generics = if allow_turbofish
+                    && self.at(Token::DoubleColon)
+                    && self.next_is(Token::Less)
+                {
+                    self.bump();
+                    self.parse_path_generics(ParserErrorReason::AssociatedTypesNotAllowedInPaths)
+                } else {
+                    None
+                };
+
+                segments.push(PathSegment {
+                    ident,
+                    generics,
+                    location: self.location_since(location),
+                });
+
+                if self.at(Token::DoubleColon)
+                    && matches!(self.next_token.token(), Token::Ident(..))
+                {
+                    // Skip the double colons
+                    self.bump();
+                } else {
+                    if allow_trailing_double_colon && self.eat_double_colon() {
+                        self.expected_identifier();
+                        break;
+                    }
+
+                    break;
+                }
             }
         }
 
-        parse_all_failing(path(), vec!["std::", "::std", "std::hash::", "foo::1"]);
+        let location = self.location_since(start_location);
+        Path { segments, kind, kind_location: start_location, location }
+    }
+
+    /// PathGenerics = GenericTypeArgs
+    pub(super) fn parse_path_generics(
+        &mut self,
+        on_named_arg_error: ParserErrorReason,
+    ) -> Option<Vec<UnresolvedType>> {
+        if self.token.token() != &Token::Less {
+            return None;
+        };
+
+        let generics = self.parse_generic_type_args();
+        for (name, _typ) in &generics.named_args {
+            self.push_error(on_named_arg_error.clone(), name.location());
+        }
+
+        Some(generics.ordered_args)
+    }
+
+    /// PathKind
+    ///     | 'crate' '::'
+    ///     | 'dep' '::'
+    ///     | 'super' '::'
+    ///     | nothing
+    pub(super) fn parse_path_kind(&mut self) -> PathKind {
+        let kind = if self.eat_keyword(Keyword::Crate) {
+            PathKind::Crate
+        } else if self.eat_keyword(Keyword::Dep) {
+            PathKind::Dep
+        } else if self.eat_keyword(Keyword::Super) {
+            PathKind::Super
+        } else if let Token::InternedCrate(crate_id) = self.token.token() {
+            let crate_id = *crate_id;
+            self.bump();
+            PathKind::Resolved(crate_id)
+        } else {
+            PathKind::Plain
+        };
+        if kind != PathKind::Plain {
+            self.eat_or_error(Token::DoubleColon);
+        }
+        kind
+    }
+
+    /// AsTraitPath = '<' Type 'as' PathNoTurbofish GenericTypeArgs '>' '::' identifier
+    pub(super) fn parse_as_trait_path(&mut self) -> Option<AsTraitPath> {
+        if !self.eat_less() {
+            return None;
+        }
+
+        let typ = self.parse_type_or_error();
+        self.eat_keyword_or_error(Keyword::As);
+
+        Some(self.parse_as_trait_path_for_type_after_as_keyword(typ))
+    }
+
+    pub(super) fn parse_as_trait_path_for_type_after_as_keyword(
+        &mut self,
+        typ: UnresolvedType,
+    ) -> AsTraitPath {
+        let trait_path = self.parse_path_no_turbofish_or_error();
+        let trait_generics = self.parse_generic_type_args();
+        self.eat_or_error(Token::Greater);
+        self.eat_or_error(Token::DoubleColon);
+        let impl_item = if let Some(ident) = self.eat_non_underscore_ident() {
+            ident
+        } else {
+            self.expected_identifier();
+            Ident::new(String::new(), self.location_at_previous_token_end())
+        };
+
+        AsTraitPath { typ, trait_path, trait_generics, impl_item }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use insta::assert_snapshot;
+
+    use crate::{
+        ast::{Path, PathKind},
+        parser::{
+            Parser,
+            parser::tests::{expect_no_errors, get_single_error, get_source_with_error_span},
+        },
+    };
+
+    fn parse_path_no_errors(src: &str) -> Path {
+        let mut parser = Parser::for_str_with_dummy_file(src);
+        let path = parser.parse_path_or_error();
+        expect_no_errors(&parser.errors);
+        path
     }
 
     #[test]
-    fn parse_path_kinds() {
-        let cases = vec![
-            ("std", PathKind::Plain),
-            ("hash::collections", PathKind::Plain),
-            ("crate::std::hash", PathKind::Crate),
-            ("super::foo", PathKind::Super),
-        ];
+    fn parses_plain_one_segment() {
+        let src = "foo";
+        let path = parse_path_no_errors(src);
+        assert_eq!(path.kind, PathKind::Plain);
+        assert_eq!(path.segments.len(), 1);
+        assert_eq!(path.segments[0].ident.to_string(), "foo");
+        assert!(path.segments[0].generics.is_none());
+    }
 
-        for (src, expected_path_kind) in cases {
-            let path = parse_with(path(), src).unwrap();
-            assert_eq!(path.kind, expected_path_kind);
-        }
+    #[test]
+    fn parses_plain_two_segments() {
+        let src = "foo::bar";
+        let path = parse_path_no_errors(src);
+        assert_eq!(path.kind, PathKind::Plain);
+        assert_eq!(path.segments.len(), 2);
+        assert_eq!(path.segments[0].ident.to_string(), "foo");
+        assert!(path.segments[0].generics.is_none());
+        assert_eq!(path.segments[1].ident.to_string(), "bar");
+        assert!(path.segments[1].generics.is_none());
+    }
 
-        parse_all_failing(
-            path(),
-            vec!["crate", "crate::std::crate", "foo::bar::crate", "foo::dep"],
-        );
+    #[test]
+    fn parses_crate_two_segments() {
+        let src = "crate::foo::bar";
+        let path = parse_path_no_errors(src);
+        assert_eq!(path.kind, PathKind::Crate);
+        assert_eq!(path.segments.len(), 2);
+        assert_eq!(path.segments[0].ident.to_string(), "foo");
+        assert!(path.segments[0].generics.is_none());
+        assert_eq!(path.segments[1].ident.to_string(), "bar");
+        assert!(path.segments[1].generics.is_none());
+    }
+
+    #[test]
+    fn parses_super_two_segments() {
+        let src = "super::foo::bar";
+        let path = parse_path_no_errors(src);
+        assert_eq!(path.kind, PathKind::Super);
+        assert_eq!(path.segments.len(), 2);
+        assert_eq!(path.segments[0].ident.to_string(), "foo");
+        assert!(path.segments[0].generics.is_none());
+        assert_eq!(path.segments[1].ident.to_string(), "bar");
+        assert!(path.segments[1].generics.is_none());
+    }
+
+    #[test]
+    fn parses_dep_two_segments() {
+        let src = "dep::foo::bar";
+        let path = parse_path_no_errors(src);
+        assert_eq!(path.kind, PathKind::Dep);
+        assert_eq!(path.segments.len(), 2);
+        assert_eq!(path.segments[0].ident.to_string(), "foo");
+        assert!(path.segments[0].generics.is_none());
+        assert_eq!(path.segments[1].ident.to_string(), "bar");
+        assert!(path.segments[1].generics.is_none());
+    }
+
+    #[test]
+    fn parses_plain_one_segment_with_trailing_colons() {
+        let src = "foo::";
+        let mut parser = Parser::for_str_with_dummy_file(src);
+        let path = parser.parse_path_or_error();
+        assert_eq!(path.location.span.end() as usize, src.len());
+        assert_eq!(parser.errors.len(), 1);
+        assert_eq!(path.kind, PathKind::Plain);
+        assert_eq!(path.segments.len(), 1);
+        assert_eq!(path.segments[0].ident.to_string(), "foo");
+        assert!(path.segments[0].generics.is_none());
+    }
+
+    #[test]
+    fn parses_with_turbofish() {
+        let src = "foo::<T, i32>::bar";
+        let mut path = parse_path_no_errors(src);
+        assert_eq!(path.kind, PathKind::Plain);
+        assert_eq!(path.segments.len(), 2);
+        assert_eq!(path.segments[0].ident.to_string(), "foo");
+
+        let generics = path.segments.remove(0).generics;
+        assert_eq!(generics.unwrap().len(), 2);
+
+        let generics = path.segments.remove(0).generics;
+        assert!(generics.is_none());
+    }
+
+    #[test]
+    fn parses_path_stops_before_trailing_double_colon() {
+        let src = "foo::bar::";
+        let mut parser = Parser::for_str_with_dummy_file(src);
+        let path = parser.parse_path_or_error();
+        assert_eq!(path.location.span.end() as usize, src.len());
+        assert_eq!(parser.errors.len(), 1);
+        assert_eq!(path.to_string(), "foo::bar");
+    }
+
+    #[test]
+    fn parses_path_with_turbofish_stops_before_trailing_double_colon() {
+        let src = "foo::bar::<1>::";
+        let mut parser = Parser::for_str_with_dummy_file(src);
+        let path = parser.parse_path_or_error();
+        assert_eq!(path.location.span.end() as usize, src.len());
+        assert_eq!(parser.errors.len(), 1);
+        assert_eq!(path.to_string(), "foo::bar::<1>");
+    }
+
+    #[test]
+    fn errors_on_crate_double_colons() {
+        let src = "
+        crate:: 
+               ^
+        ";
+        let (src, span) = get_source_with_error_span(src);
+        let mut parser = Parser::for_str_with_dummy_file(&src);
+        let path = parser.parse_path();
+        assert!(path.is_none());
+
+        let error = get_single_error(&parser.errors, span);
+        assert_snapshot!(error.to_string(), @"Expected an identifier but found end of input");
     }
 }

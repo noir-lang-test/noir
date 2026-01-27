@@ -1,17 +1,19 @@
 use std::field::modulus_num_bits;
 use std::meta::unquote;
 
+// Numeric generics default to u32
+global three_field: Field = 3;
+
 fn main() {
-    comptime
-    {
-        foo::<3>(5);
+    comptime {
+        foo::<three_field>(5);
         submodule::bar();
     }
 }
 
 // Call a different function from the interpreter, then have the
 // elaborator switch to the middle of foo from its previous scope in main
-unconstrained comptime fn foo<let N: Field>(x: Field) {
+comptime fn foo<let N: Field>(x: Field) {
     assert(modulus_num_bits() != 0);
 
     let cond = quote { modulus_num_bits() != 0 };
@@ -31,8 +33,8 @@ unconstrained comptime fn foo<let N: Field>(x: Field) {
         break;
     }
 
-    let loop = quote { for _ in 0..0 { break; } };
-    unquote!(loop);
+    let loop_ = quote { for _ in 0..0 { break; } };
+    unquote!(loop_);
 }
 
 mod submodule {

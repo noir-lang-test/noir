@@ -1,135 +1,65 @@
-use codespan::Span as ByteSpan;
 use fm::FileId;
+use noirc_span::Span;
 use serde::{Deserialize, Serialize};
 use std::{
+    cmp::Ordering,
     hash::{Hash, Hasher},
-    ops::Range,
 };
 
 pub type Position = u32;
 
-#[derive(PartialOrd, Eq, Ord, Debug, Clone)]
-pub struct Spanned<T> {
+#[derive(Eq, Debug, Clone)]
+pub struct Located<T> {
     pub contents: T,
-    span: Span,
+    location: Location,
 }
 
-/// This is important for tests. Two Spanned objects are equal if their content is equal
-/// They may not have the same span. Use into_span to test for Span being equal specifically
-impl<T: std::cmp::PartialEq> PartialEq<Spanned<T>> for Spanned<T> {
-    fn eq(&self, other: &Spanned<T>) -> bool {
+/// This is important for tests. Two Located objects are equal if their content is equal
+/// They may not have the same location. Use `.location()` to test for Location being equal specifically
+impl<T: PartialEq> PartialEq<Located<T>> for Located<T> {
+    fn eq(&self, other: &Located<T>) -> bool {
         self.contents == other.contents
+    }
+}
+
+impl<T: PartialOrd> PartialOrd<Located<T>> for Located<T> {
+    fn partial_cmp(&self, other: &Located<T>) -> Option<Ordering> {
+        self.contents.partial_cmp(&other.contents)
+    }
+}
+
+impl<T: Ord> Ord for Located<T> {
+    fn cmp(&self, other: &Located<T>) -> Ordering {
+        self.contents.cmp(&other.contents)
+    }
+}
+
+impl<T: Default> Default for Located<T> {
+    fn default() -> Self {
+        Self { contents: Default::default(), location: Location::dummy() }
     }
 }
 
 /// Hash-based data structures (HashMap, HashSet) rely on the inverse of Hash
 /// being injective, i.e. x.eq(y) => hash(x, H) == hash(y, H), we hence align
 /// this with the above
-impl<T: Hash> Hash for Spanned<T> {
+impl<T: Hash> Hash for Located<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.contents.hash(state);
     }
 }
 
-impl<T> Spanned<T> {
-    pub fn from_position(start: Position, end: Position, contents: T) -> Spanned<T> {
-        Spanned { span: Span::inclusive(start, end), contents }
-    }
-
-    pub const fn from(t_span: Span, contents: T) -> Spanned<T> {
-        Spanned { span: t_span, contents }
+impl<T> Located<T> {
+    pub fn from(location: Location, contents: T) -> Located<T> {
+        Located { location, contents }
     }
 
     pub fn span(&self) -> Span {
-        self.span
-    }
-}
-
-impl<T> std::borrow::Borrow<T> for Spanned<T> {
-    fn borrow(&self) -> &T {
-        &self.contents
-    }
-}
-
-#[derive(
-    PartialEq, PartialOrd, Eq, Ord, Hash, Debug, Copy, Clone, Default, Deserialize, Serialize,
-)]
-pub struct Span(ByteSpan);
-
-impl Span {
-    pub fn inclusive(start: u32, end: u32) -> Span {
-        Span(ByteSpan::from(start..end + 1))
+        self.location.span
     }
 
-    pub fn single_char(start: u32) -> Span {
-        Span::inclusive(start, start)
-    }
-
-    pub fn empty(position: u32) -> Span {
-        Span::from(position..position)
-    }
-
-    #[must_use]
-    pub fn merge(self, other: Span) -> Span {
-        Span(self.0.merge(other.0))
-    }
-
-    pub fn to_byte_span(self) -> ByteSpan {
-        self.0
-    }
-
-    pub fn start(&self) -> u32 {
-        self.0.start().into()
-    }
-
-    pub fn end(&self) -> u32 {
-        self.0.end().into()
-    }
-
-    pub fn contains(&self, other: &Span) -> bool {
-        self.start() <= other.start() && self.end() >= other.end()
-    }
-
-    pub fn intersects(&self, other: &Span) -> bool {
-        self.end() > other.start() && self.start() < other.end()
-    }
-
-    pub fn is_smaller(&self, other: &Span) -> bool {
-        let self_distance = self.end() - self.start();
-        let other_distance = other.end() - other.start();
-        self_distance < other_distance
-    }
-}
-
-impl From<Span> for Range<usize> {
-    fn from(span: Span) -> Self {
-        span.0.into()
-    }
-}
-
-impl From<Range<u32>> for Span {
-    fn from(Range { start, end }: Range<u32>) -> Self {
-        Self(ByteSpan::new(start, end))
-    }
-}
-
-impl chumsky::Span for Span {
-    type Context = ();
-
-    type Offset = u32;
-
-    fn new(_context: Self::Context, range: Range<Self::Offset>) -> Self {
-        Span(ByteSpan::from(range))
-    }
-
-    fn context(&self) -> Self::Context {}
-
-    fn start(&self) -> Self::Offset {
-        self.start()
-    }
-
-    fn end(&self) -> Self::Offset {
-        self.end()
+    pub fn location(&self) -> Location {
+        self.location
     }
 }
 
@@ -144,11 +74,32 @@ impl Location {
         Self { span, file }
     }
 
-    pub fn dummy() -> Self {
-        Self { span: Span::single_char(0), file: FileId::dummy() }
+    pub const fn dummy() -> Self {
+        Self { span: Span::initial(), file: FileId::dummy() }
     }
 
     pub fn contains(&self, other: &Location) -> bool {
         self.file == other.file && self.span.contains(&other.span)
+    }
+
+    #[must_use]
+    pub fn merge(self, other: Location) -> Location {
+        if self.file == other.file {
+            Location::new(self.span.merge(other.span), self.file)
+        } else {
+            self
+        }
+    }
+}
+
+impl Ord for Location {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.file, self.span).cmp(&(other.file, other.span))
+    }
+}
+
+impl PartialOrd for Location {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }

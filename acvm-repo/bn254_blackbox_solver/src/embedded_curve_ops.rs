@@ -1,4 +1,3 @@
-// TODO(https://github.com/noir-lang/noir/issues/4932): rename this file to something more generic
 use ark_ec::AffineRepr;
 use ark_ff::MontConfig;
 use num_bigint::BigUint;
@@ -9,6 +8,19 @@ use acir::BlackBoxFunc;
 
 use crate::BlackBoxResolutionError;
 
+/// Converts a field element to u128, returning an error if it doesn't fit.
+fn field_to_u128_limb(
+    limb: &FieldElement,
+    func: BlackBoxFunc,
+) -> Result<u128, BlackBoxResolutionError> {
+    limb.try_into_u128().ok_or_else(|| {
+        BlackBoxResolutionError::Failed(
+            func,
+            format!("Limb {} is not less than 2^128", limb.to_hex()),
+        )
+    })
+}
+
 /// Performs multi scalar multiplication of points with scalars.
 pub fn multi_scalar_mul(
     points: &[FieldElement],
@@ -16,41 +28,37 @@ pub fn multi_scalar_mul(
     scalars_hi: &[FieldElement],
 ) -> Result<(FieldElement, FieldElement, FieldElement), BlackBoxResolutionError> {
     if points.len() != 3 * scalars_lo.len() || scalars_lo.len() != scalars_hi.len() {
-        dbg!(&points.len(), &scalars_lo.len(), &scalars_hi.len());
         return Err(BlackBoxResolutionError::Failed(
             BlackBoxFunc::MultiScalarMul,
             "Points and scalars must have the same length".to_string(),
         ));
     }
 
-    let mut output_point = grumpkin::SWAffine::zero();
+    let mut output_point = ark_grumpkin::Affine::zero();
 
     for i in (0..points.len()).step_by(3) {
-        let point =
-            create_point(points[i], points[i + 1], points[i + 2] == FieldElement::from(1_u128))
-                .map_err(|e| BlackBoxResolutionError::Failed(BlackBoxFunc::MultiScalarMul, e))?;
-
-        let scalar_low: u128 = scalars_lo[i / 3].try_into_u128().ok_or_else(|| {
-            BlackBoxResolutionError::Failed(
+        if points[i + 2] > FieldElement::one() {
+            return Err(BlackBoxResolutionError::Failed(
                 BlackBoxFunc::MultiScalarMul,
-                format!("Limb {} is not less than 2^128", scalars_lo[i].to_hex()),
-            )
-        })?;
+                "EmbeddedCurvePoint is malformed (non-boolean `is_infinite` flag)".to_string(),
+            ));
+        }
+        let point = create_point(points[i], points[i + 1], points[i + 2])
+            .map_err(|e| BlackBoxResolutionError::Failed(BlackBoxFunc::MultiScalarMul, e))?;
 
-        let scalar_high: u128 = scalars_hi[i / 3].try_into_u128().ok_or_else(|| {
-            BlackBoxResolutionError::Failed(
-                BlackBoxFunc::MultiScalarMul,
-                format!("Limb {} is not less than 2^128", scalars_hi[i].to_hex()),
-            )
-        })?;
+        let scalar_low: u128 =
+            field_to_u128_limb(&scalars_lo[i / 3], BlackBoxFunc::MultiScalarMul)?;
+
+        let scalar_high: u128 =
+            field_to_u128_limb(&scalars_hi[i / 3], BlackBoxFunc::MultiScalarMul)?;
 
         let mut bytes = scalar_high.to_be_bytes().to_vec();
         bytes.extend_from_slice(&scalar_low.to_be_bytes());
 
-        // Check if this is smaller than the grumpkin modulus
         let grumpkin_integer = BigUint::from_bytes_be(&bytes);
 
-        if grumpkin_integer >= grumpkin::FrConfig::MODULUS.into() {
+        // Check if this is smaller than the grumpkin modulus
+        if grumpkin_integer >= ark_grumpkin::FrConfig::MODULUS.into() {
             return Err(BlackBoxResolutionError::Failed(
                 BlackBoxFunc::MultiScalarMul,
                 format!("{} is not a valid grumpkin scalar", grumpkin_integer.to_str_radix(16)),
@@ -58,16 +66,16 @@ pub fn multi_scalar_mul(
         }
 
         let iteration_output_point =
-            grumpkin::SWAffine::from(point.mul_bigint(grumpkin_integer.to_u64_digits()));
+            ark_grumpkin::Affine::from(point.mul_bigint(grumpkin_integer.to_u64_digits()));
 
-        output_point = grumpkin::SWAffine::from(output_point + iteration_output_point);
+        output_point = ark_grumpkin::Affine::from(output_point + iteration_output_point);
     }
 
     if let Some((out_x, out_y)) = output_point.xy() {
         Ok((
-            FieldElement::from_repr(*out_x),
-            FieldElement::from_repr(*out_y),
-            FieldElement::from(output_point.is_zero() as u128),
+            FieldElement::from_repr(out_x),
+            FieldElement::from_repr(out_y),
+            FieldElement::from(u128::from(output_point.is_zero())),
         ))
     } else {
         Ok((FieldElement::from(0_u128), FieldElement::from(0_u128), FieldElement::from(1_u128)))
@@ -78,36 +86,48 @@ pub fn embedded_curve_add(
     input1: [FieldElement; 3],
     input2: [FieldElement; 3],
 ) -> Result<(FieldElement, FieldElement, FieldElement), BlackBoxResolutionError> {
-    let point1 = create_point(input1[0], input1[1], input1[2] == FieldElement::one())
-        .map_err(|e| BlackBoxResolutionError::Failed(BlackBoxFunc::EmbeddedCurveAdd, e))?;
-    let point2 = create_point(input2[0], input2[1], input2[2] == FieldElement::one())
-        .map_err(|e| BlackBoxResolutionError::Failed(BlackBoxFunc::EmbeddedCurveAdd, e))?;
-    let res = grumpkin::SWAffine::from(point1 + point2);
-    if let Some((res_x, res_y)) = res.xy() {
-        Ok((
-            FieldElement::from_repr(*res_x),
-            FieldElement::from_repr(*res_y),
-            FieldElement::from(res.is_zero() as u128),
-        ))
-    } else if res.is_zero() {
-        Ok((FieldElement::from(0_u128), FieldElement::from(0_u128), FieldElement::from(1_u128)))
-    } else {
-        Err(BlackBoxResolutionError::Failed(
+    if input1[2] > FieldElement::one() || input2[2] > FieldElement::one() {
+        return Err(BlackBoxResolutionError::Failed(
             BlackBoxFunc::EmbeddedCurveAdd,
-            "Point is not on curve".to_string(),
-        ))
+            "EmbeddedCurvePoint is malformed (non-boolean `is_infinite` flag)".to_string(),
+        ));
+    }
+
+    let point1 = create_point(input1[0], input1[1], input1[2])
+        .map_err(|e| BlackBoxResolutionError::Failed(BlackBoxFunc::EmbeddedCurveAdd, e))?;
+    let point2 = create_point(input2[0], input2[1], input2[2])
+        .map_err(|e| BlackBoxResolutionError::Failed(BlackBoxFunc::EmbeddedCurveAdd, e))?;
+
+    for point in [point1, point2] {
+        if point == ark_grumpkin::Affine::zero() {
+            return Err(BlackBoxResolutionError::Failed(
+                BlackBoxFunc::EmbeddedCurveAdd,
+                format!("Infinite input: embedded_curve_add({point1}, {point2})"),
+            ));
+        }
+    }
+
+    let res = ark_grumpkin::Affine::from(point1 + point2);
+    if let Some((res_x, res_y)) = res.xy() {
+        Ok((FieldElement::from_repr(res_x), FieldElement::from_repr(res_y), FieldElement::zero()))
+    } else {
+        assert!(res.is_zero());
+        Ok((FieldElement::from(0_u128), FieldElement::from(0_u128), FieldElement::from(1_u128)))
     }
 }
 
 fn create_point(
     x: FieldElement,
     y: FieldElement,
-    is_infinite: bool,
-) -> Result<grumpkin::SWAffine, String> {
-    if is_infinite {
-        return Ok(grumpkin::SWAffine::zero());
+    is_infinite: FieldElement,
+) -> Result<ark_grumpkin::Affine, String> {
+    if is_infinite.is_one() {
+        return Ok(ark_grumpkin::Affine::zero());
+    } else if !is_infinite.is_zero() {
+        return Err("`is_infinite` flag is non-boolean".to_string());
     }
-    let point = grumpkin::SWAffine::new_unchecked(x.into_repr(), y.into_repr());
+
+    let point = ark_grumpkin::Affine::new_unchecked(x.into_repr(), y.into_repr());
     if !point.is_on_curve() {
         return Err(format!("Point ({}, {}) is not on curve", x.to_hex(), y.to_hex()));
     };
@@ -120,13 +140,12 @@ fn create_point(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use ark_ff::BigInteger;
 
     fn get_generator() -> [FieldElement; 3] {
-        let generator = grumpkin::SWAffine::generator();
-        let generator_x = FieldElement::from_repr(*generator.x().unwrap());
-        let generator_y = FieldElement::from_repr(*generator.y().unwrap());
+        let generator = ark_grumpkin::Affine::generator();
+        let generator_x = FieldElement::from_repr(generator.x().unwrap());
+        let generator_y = FieldElement::from_repr(generator.y().unwrap());
         [generator_x, generator_y, FieldElement::zero()]
     }
 
@@ -177,9 +196,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_grumpkin_modulus() {
-        let x = grumpkin::FrConfig::MODULUS.to_bytes_be();
-
+    fn rejects_grumpkin_modulus_when_pedantic() {
+        let x = ark_grumpkin::FrConfig::MODULUS.to_bytes_be();
         let low = FieldElement::from_be_bytes_reduce(&x[16..32]);
         let high = FieldElement::from_be_bytes_reduce(&x[0..16]);
 
@@ -253,6 +271,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_addition_of_infinite_points_when_pedantic() {
+        let x = FieldElement::from(1u128);
+        let y = FieldElement::from(1u128);
+
+        let res = embedded_curve_add(
+            [x, y, FieldElement::from(1u128)],
+            [x, y, FieldElement::from(1u128)],
+        );
+
+        assert_eq!(
+            res,
+            Err(BlackBoxResolutionError::Failed(
+                BlackBoxFunc::EmbeddedCurveAdd,
+                "Infinite input: embedded_curve_add(infinity, infinity)".into(),
+            ))
+        );
+    }
+
+    #[test]
     fn output_of_msm_matches_add() -> Result<(), BlackBoxResolutionError> {
         let points = get_generator();
         let scalars_lo = [FieldElement::from(2u128)];
@@ -267,5 +304,24 @@ mod tests {
         assert_eq!(msm_res.0, add_res.0);
         assert_eq!(msm_res.1, add_res.1);
         Ok(())
+    }
+
+    #[test]
+    fn rejects_non_boolean_is_infinite_flag() {
+        let a = get_generator();
+
+        let mut b = get_generator();
+        // Manipulate `is_infinite` to be non-boolean.
+        b[2] = FieldElement::from(2u32);
+
+        let res = embedded_curve_add(a, b);
+
+        assert_eq!(
+            res,
+            Err(BlackBoxResolutionError::Failed(
+                BlackBoxFunc::EmbeddedCurveAdd,
+                "EmbeddedCurvePoint is malformed (non-boolean `is_infinite` flag)".into(),
+            ))
+        );
     }
 }

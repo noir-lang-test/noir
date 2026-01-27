@@ -18,6 +18,33 @@ fn id<T>(x: T) -> T  {
 }
 ```
 
+## Numeric Generics
+
+If we want to be generic over array lengths (which are type-level integers), we can use numeric
+generics. Using these looks similar to using regular generics, but introducing them into scope
+requires declaring them with `let MyGenericName: IntegerType`. This can be done anywhere a normal
+generic is declared. Instead of types, these generics resolve to integers at compile-time.
+Here's an example of a struct that is generic over the size of the array it contains internally:
+
+```rust
+struct BigInt<let N: u32> {
+    limbs: [u32; N],
+}
+
+impl<let N: u32> BigInt<N> {
+    // `N` is in scope of all methods in the impl
+    fn first(first: BigInt<N>, second: BigInt<N>) -> Self {
+        assert(first.limbs != second.limbs);
+        first
+    }
+
+    fn second(first: BigInt<N>, second: Self) -> Self {
+        assert(first.limbs != second.limbs);
+        second
+    }
+}
+```
+
 ## In Structs
 
 Generics are useful for specifying types in structs. For example, we can specify that a field in a
@@ -26,7 +53,7 @@ struct will be of a certain generic type. In this case `value` is of type `T`.
 ```rust
 struct RepeatedValue<T> {
     value: T,
-    count: Field,
+    count: u32,
 }
 
 impl<T> RepeatedValue<T> {
@@ -45,29 +72,6 @@ fn main() {
 
 The `print` function will print `Hello!` an arbitrary number of times, twice in this case.
 
-If we want to be generic over array lengths (which are type-level integers), we can use numeric
-generics. Using these looks just like using regular generics, but these generics can resolve to
-integers at compile-time, rather than resolving to types. Here's an example of a struct that is
-generic over the size of the array it contains internally:
-
-```rust
-struct BigInt<N> {
-    limbs: [u32; N],
-}
-
-impl<N> BigInt<N> {
-    // `N` is in scope of all methods in the impl
-    fn first(first: BigInt<N>, second: BigInt<N>) -> Self {
-        assert(first.limbs != second.limbs);
-        first
-
-    fn second(first: BigInt<N>, second: Self) -> Self {
-        assert(first.limbs != second.limbs);
-        second
-    }
-}
-```
-
 ## Calling functions on generic parameters
 
 Since a generic type `T` can represent any type, how can we call functions on the underlying type?
@@ -77,7 +81,7 @@ This is what [traits](../concepts/traits.md) are for in Noir. Here's an example 
 any type `T` that implements the `Eq` trait for equality:
 
 ```rust
-fn first_element_is_equal<T, N>(array1: [T; N], array2: [T; N]) -> bool 
+fn first_element_is_equal<T, let N: u32>(array1: [T; N], array2: [T; N]) -> bool 
     where T: Eq
 {
     if (array1.len() == 0) | (array2.len() == 0) {
@@ -93,7 +97,17 @@ fn main() {
     // We can use first_element_is_equal for arrays of any type
     // as long as we have an Eq impl for the types we pass in
     let array = [MyStruct::new(), MyStruct::new()];
-    assert(array_eq(array, array, MyStruct::eq));
+    assert(first_element_is_equal(array, array));
+}
+
+struct MyStruct {
+    foo: Field
+}
+
+impl MyStruct {
+    fn new() -> Self {
+        MyStruct { foo: 0 }
+    }
 }
 
 impl Eq for MyStruct {
@@ -115,22 +129,15 @@ The name "turbofish" comes from that `::<>` looks like a little fish.
 Examples:
 ```rust
 fn main() {
-    let mut slice = [];
-    slice = slice.push_back(1);
-    slice = slice.push_back(2);
+    let mut vector = [];
+    vector = vector.push_back(1);
+    vector = vector.push_back(2);
     // Without turbofish a type annotation would be needed on the left hand side
-    let array = slice.as_array::<2>();
+    let array = vector.as_array::<2>();
 }
 ```
-```rust
-fn double<let N: u32>() -> u32 {
-    N * 2
-}
-fn example() {
-    assert(double::<9>() == 18);
-    assert(double::<7 + 8>() == 30);
-}
-```
+
+
 ```rust
 trait MyTrait {
     fn ten() -> Self;
@@ -156,8 +163,52 @@ fn example() {
     // there is no matching impl for `u32: MyTrait`. 
     //
     // Substituting the `10` on the left hand side of this assert
-    // with `10 as u32` would also fail with a type mismatch as we 
+    // with `10 as u32` would fail with a type mismatch as we 
     // are expecting a `Field` from the right hand side.
-    assert(10 as u32 == foo.generic_method::<Field>());
+    assert(10 == foo.generic_method::<Field>());
 }
 ```
+
+## Arithmetic Generics
+
+In addition to numeric generics, Noir also allows a limited form of arithmetic on generics.
+When you have a numeric generic such as `N`, you can use the following operators on it in a
+type position: `+`, `-`, `*`, `/`, and `%`.
+
+Note that type checking arithmetic generics is a best effort guess from the compiler and there
+are many cases of types that are equal that the compiler may not see as such. For example,
+we know that `T * (N + M)` should be equal to `T*N + T*M` but the compiler does not currently
+apply the distributive law and thus sees these as different types.
+
+Even with this limitation though, the compiler can handle common cases decently well:
+
+```rust
+trait Serialize<let N: u32> {
+    fn serialize(self) -> [Field; N];
+}
+
+impl Serialize<1> for Field {
+    fn serialize(self) -> [Field; 1] {
+        [self]
+    }
+}
+
+impl<T, let N: u32, let M: u32> Serialize<N * M> for [T; N]
+    where T: Serialize<M> { .. }
+
+impl<T, U, let N: u32, let M: u32> Serialize<N + M> for (T, U)
+    where T: Serialize<N>, U: Serialize<M> { .. }
+
+fn main() {
+    let data = (1, [2, 3, 4]);
+    assert_eq(data.serialize().len(), 4);
+}
+```
+
+Note that if there is any over or underflow the types will fail to unify:
+
+#include_code underflow-example test_programs/compile_failure/arithmetic_generics_underflow/src/main.nr rust
+
+This also applies if there is underflow in an intermediate calculation:
+
+#include_code intermediate-underflow-example test_programs/compile_failure/arithmetic_generics_intermediate_underflow/src/main.nr rust

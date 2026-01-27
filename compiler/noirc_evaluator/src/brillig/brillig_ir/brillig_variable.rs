@@ -1,11 +1,19 @@
+use std::ops::Deref;
+
 use acvm::{
-    acir::AcirField,
-    brillig_vm::brillig::{HeapArray, HeapValueType, HeapVector, MemoryAddress, ValueOrArray},
     FieldElement,
+    acir::{
+        AcirField,
+        brillig::{BitSize, lengths::SemiFlattenedLength},
+    },
+    brillig_vm::brillig::{HeapValueType, MemoryAddress},
 };
 use serde::{Deserialize, Serialize};
 
-use crate::ssa::ir::types::Type;
+use crate::{
+    brillig::brillig_ir::registers::{Allocated, RegisterAllocator},
+    ssa::ir::types::Type,
+};
 
 use super::BRILLIG_MEMORY_ADDRESSING_BIT_SIZE;
 
@@ -29,48 +37,21 @@ impl SingleAddrVariable {
     }
 }
 
-/// The representation of a noir array in the Brillig IR
+/// The representation of a Noir array in the Brillig IR
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy)]
 pub(crate) struct BrilligArray {
     pub(crate) pointer: MemoryAddress,
-    pub(crate) size: usize,
-    pub(crate) rc: MemoryAddress,
+    /// The number of memory slots the array occupies.
+    ///
+    /// This is the flattened size of the array, where complex types
+    /// take up more than one slot.
+    pub(crate) size: SemiFlattenedLength,
 }
 
-impl BrilligArray {
-    pub(crate) fn to_heap_array(self) -> HeapArray {
-        HeapArray { pointer: self.pointer, size: self.size }
-    }
-
-    pub(crate) fn registers_count() -> usize {
-        2
-    }
-
-    pub(crate) fn extract_registers(self) -> Vec<MemoryAddress> {
-        vec![self.pointer, self.rc]
-    }
-}
-
-/// The representation of a noir slice in the Brillig IR
+/// The representation of a noir vector in the Brillig IR
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy)]
 pub(crate) struct BrilligVector {
     pub(crate) pointer: MemoryAddress,
-    pub(crate) size: MemoryAddress,
-    pub(crate) rc: MemoryAddress,
-}
-
-impl BrilligVector {
-    pub(crate) fn to_heap_vector(self) -> HeapVector {
-        HeapVector { pointer: self.pointer, size: self.size }
-    }
-
-    pub(crate) fn registers_count() -> usize {
-        3
-    }
-
-    pub(crate) fn extract_registers(self) -> Vec<MemoryAddress> {
-        vec![self.pointer, self.size, self.rc]
-    }
 }
 
 /// The representation of a noir value in the Brillig IR
@@ -82,13 +63,19 @@ pub(crate) enum BrilligVariable {
 }
 
 impl BrilligVariable {
+    /// Extract a [SingleAddrVariable].
+    ///
+    /// Panics if the variable is an array or vector.
     pub(crate) fn extract_single_addr(self) -> SingleAddrVariable {
         match self {
             BrilligVariable::SingleAddr(single_addr) => single_addr,
-            _ => unreachable!("ICE: Expected register, got {self:?}"),
+            _ => unreachable!("ICE: Expected single address, got {self:?}"),
         }
     }
 
+    /// Extract a [BrilligArray].
+    ///
+    /// Panics if it's a single address variable or a vector.
     pub(crate) fn extract_array(self) -> BrilligArray {
         match self {
             BrilligVariable::BrilligArray(array) => array,
@@ -96,6 +83,9 @@ impl BrilligVariable {
         }
     }
 
+    /// Extract a [BrilligVector].
+    ///
+    /// Panics if it's a single address variable or an array.
     pub(crate) fn extract_vector(self) -> BrilligVector {
         match self {
             BrilligVariable::BrilligVector(vector) => vector,
@@ -103,37 +93,72 @@ impl BrilligVariable {
         }
     }
 
-    pub(crate) fn extract_registers(self) -> Vec<MemoryAddress> {
+    /// Extract the [MemoryAddress] out of any [BrilligVariable].
+    ///
+    /// This can be deallocated to make the memory available for reuse.
+    ///
+    /// Note that this is a single address even for vectors, because this is a `BrilligVector`, not a `HeapVector`.
+    pub(crate) fn extract_register(self) -> MemoryAddress {
         match self {
-            BrilligVariable::SingleAddr(single_addr) => vec![single_addr.address],
-            BrilligVariable::BrilligArray(array) => array.extract_registers(),
-            BrilligVariable::BrilligVector(vector) => vector.extract_registers(),
-        }
-    }
-
-    pub(crate) fn to_value_or_array(self) -> ValueOrArray {
-        match self {
-            BrilligVariable::SingleAddr(single_addr) => {
-                ValueOrArray::MemoryAddress(single_addr.address)
-            }
-            BrilligVariable::BrilligArray(array) => ValueOrArray::HeapArray(array.to_heap_array()),
-            BrilligVariable::BrilligVector(vector) => {
-                ValueOrArray::HeapVector(vector.to_heap_vector())
-            }
+            BrilligVariable::SingleAddr(single_addr) => single_addr.address,
+            BrilligVariable::BrilligArray(array) => array.pointer,
+            BrilligVariable::BrilligVector(vector) => vector.pointer,
         }
     }
 }
 
+impl From<SingleAddrVariable> for BrilligVariable {
+    fn from(value: SingleAddrVariable) -> Self {
+        Self::SingleAddr(value)
+    }
+}
+
+impl From<BrilligArray> for BrilligVariable {
+    fn from(value: BrilligArray) -> Self {
+        Self::BrilligArray(value)
+    }
+}
+
+impl From<BrilligVector> for BrilligVariable {
+    fn from(value: BrilligVector) -> Self {
+        Self::BrilligVector(value)
+    }
+}
+
+impl<T, R: RegisterAllocator> From<&Allocated<T, R>> for BrilligVariable
+where
+    BrilligVariable: From<T>,
+    T: Copy,
+{
+    fn from(value: &Allocated<T, R>) -> Self {
+        Self::from(*value.deref())
+    }
+}
+
+/// Convenience method to convert e.g. an `Allocated<BrilligArray, _>` to a `BrilligVariable`.
+#[cfg(test)]
+impl<T, R: RegisterAllocator> Allocated<T, R>
+where
+    BrilligVariable: From<T>,
+    T: Copy,
+{
+    /// Convert the allocated value into a [BrilligVariable].
+    pub(crate) fn to_var(&self) -> BrilligVariable {
+        BrilligVariable::from(**self)
+    }
+}
+
+/// Convert an SSA [Type] to [HeapValueType] for passing values to foreign calls.
 pub(crate) fn type_to_heap_value_type(typ: &Type) -> HeapValueType {
     match typ {
-        Type::Numeric(_) | Type::Reference(_) | Type::Function => {
-            HeapValueType::Simple(get_bit_size_from_ssa_type(typ))
-        }
+        Type::Numeric(_) | Type::Reference(_) | Type::Function => HeapValueType::Simple(
+            BitSize::try_from_u32::<FieldElement>(get_bit_size_from_ssa_type(typ)).unwrap(),
+        ),
         Type::Array(elem_type, size) => HeapValueType::Array {
             value_types: elem_type.as_ref().iter().map(type_to_heap_value_type).collect(),
-            size: typ.element_size() * size,
+            size: *size,
         },
-        Type::Slice(elem_type) => HeapValueType::Vector {
+        Type::Vector(elem_type) => HeapValueType::Vector {
             value_types: elem_type.as_ref().iter().map(type_to_heap_value_type).collect(),
         },
     }
@@ -147,5 +172,54 @@ pub(crate) fn get_bit_size_from_ssa_type(typ: &Type) -> u32 {
         // instrumentation to work properly)
         Type::Function => 32,
         typ => typ.bit_size(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use acvm::acir::brillig::{
+        HeapValueType,
+        lengths::{FlattenedLength, SemanticLength},
+    };
+
+    use crate::{
+        brillig::brillig_ir::brillig_variable::type_to_heap_value_type, ssa::ir::types::Type,
+    };
+
+    #[test]
+    fn type_to_heap_value_type_flattened_size() {
+        // typ = [(u32, bool); 3]
+        let typ = Type::Array(Arc::new(vec![Type::unsigned(32), Type::bool()]), SemanticLength(3));
+        let typ = type_to_heap_value_type(&typ);
+        assert_eq!(typ.flattened_size(), Some(FlattenedLength(6)));
+
+        let HeapValueType::Array { value_types: _, size } = typ else {
+            panic!("Expected array type");
+        };
+        assert_eq!(size, SemanticLength(3));
+
+        // typ = [[u32; 4]; 2]
+        let arr = Type::Array(Arc::new(vec![Type::unsigned(32)]), SemanticLength(4));
+        let typ = Type::Array(Arc::new(vec![arr]), SemanticLength(2));
+        let typ = type_to_heap_value_type(&typ);
+        assert_eq!(typ.flattened_size(), Some(FlattenedLength(8)));
+
+        let HeapValueType::Array { value_types: _, size } = typ else {
+            panic!("Expected array type");
+        };
+        assert_eq!(size, SemanticLength(2));
+
+        // typ = [([u32; 4], bool); 2]
+        let arr = Type::Array(Arc::new(vec![Type::unsigned(32)]), SemanticLength(4));
+        let typ = Type::Array(Arc::new(vec![arr, Type::bool()]), SemanticLength(2));
+        let typ = type_to_heap_value_type(&typ);
+        assert_eq!(typ.flattened_size(), Some(FlattenedLength(10)));
+
+        let HeapValueType::Array { value_types: _, size } = typ else {
+            panic!("Expected array type");
+        };
+        assert_eq!(size, SemanticLength(2));
     }
 }

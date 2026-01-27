@@ -1,21 +1,27 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
+use acvm::FieldElement;
 use iter_extended::vecmap;
 use noirc_frontend::monomorphization::ast::InlineType;
+use serde::{Deserialize, Serialize};
+
+use crate::ssa::ir::instruction::Instruction;
+use crate::ssa::ir::post_order::PostOrder;
 
 use super::basic_block::BasicBlockId;
-use super::dfg::DataFlowGraph;
+use super::dfg::{DataFlowGraph, GlobalsGraph};
 use super::instruction::TerminatorInstruction;
 use super::map::Id;
-use super::types::Type;
-use super::value::ValueId;
+use super::types::{NumericType, Type};
+use super::value::{Value, ValueId};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum RuntimeType {
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub enum RuntimeType {
     // A noir function, to be compiled in ACIR and executed by ACVM
     Acir(InlineType),
     // Unconstrained function, to be compiled to brillig and executed by the Brillig VM
-    Brillig,
+    Brillig(InlineType),
 }
 
 impl RuntimeType {
@@ -23,11 +29,55 @@ impl RuntimeType {
     /// We return `false` for InlineType::Inline on default, which is true
     /// in all cases except for main. `main` should be supported with special
     /// handling in any places where this function determines logic.
+    ///
+    /// ## Important
+    /// If a Brillig function is not main it requires special handling to determine
+    /// whether it is an entry point. Brillig entry points can also be anywhere we start
+    /// Brillig execution from an ACIR runtime. This requires analyzing the call sites of the ACIR runtime.
     pub(crate) fn is_entry_point(&self) -> bool {
         match self {
-            RuntimeType::Acir(inline_type) => inline_type.is_entry_point(),
-            RuntimeType::Brillig => true,
+            RuntimeType::Acir(inline_type) | RuntimeType::Brillig(inline_type) => {
+                inline_type.is_entry_point()
+            }
         }
+    }
+
+    pub(crate) fn is_inline_always(&self) -> bool {
+        matches!(
+            self,
+            RuntimeType::Acir(InlineType::InlineAlways)
+                | RuntimeType::Brillig(InlineType::InlineAlways)
+        )
+    }
+
+    pub(crate) fn is_inline_never(&self) -> bool {
+        matches!(
+            self,
+            // This attribute is only allowed on Brillig functions
+            RuntimeType::Brillig(InlineType::InlineNever)
+        )
+    }
+
+    pub(crate) fn is_no_predicates(&self) -> bool {
+        matches!(
+            self,
+            RuntimeType::Acir(InlineType::NoPredicates)
+                | RuntimeType::Brillig(InlineType::NoPredicates)
+        )
+    }
+
+    pub(crate) fn is_brillig(&self) -> bool {
+        matches!(self, RuntimeType::Brillig(_))
+    }
+
+    pub(crate) fn is_acir(&self) -> bool {
+        matches!(self, RuntimeType::Acir(_))
+    }
+}
+
+impl Default for RuntimeType {
+    fn default() -> Self {
+        RuntimeType::Acir(InlineType::default())
     }
 }
 
@@ -37,17 +87,15 @@ impl RuntimeType {
 /// All functions outside of the current function are seen as external.
 /// To reference external functions its FunctionId can be used but this
 /// cannot be checked for correctness until inlining is performed.
-#[derive(Debug)]
-pub(crate) struct Function {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Function {
     /// The first basic block in the function
     entry_block: BasicBlockId,
 
     /// Name of the function for debugging only
     name: String,
 
-    id: FunctionId,
-
-    runtime: RuntimeType,
+    id: Option<FunctionId>,
 
     /// The DataFlowGraph holds the majority of data pertaining to the function
     /// including its blocks, instructions, and values.
@@ -61,42 +109,61 @@ impl Function {
     pub(crate) fn new(name: String, id: FunctionId) -> Self {
         let mut dfg = DataFlowGraph::default();
         let entry_block = dfg.make_block();
-        Self { name, id, entry_block, dfg, runtime: RuntimeType::Acir(InlineType::default()) }
+        Self { name, id: Some(id), entry_block, dfg }
+    }
+
+    /// Globals are generated using the same codegen process as functions.
+    /// To avoid a recursive global context we should create a pseudo function to mock a globals context.
+    pub(crate) fn new_for_globals() -> Self {
+        let mut dfg = DataFlowGraph::default();
+        let entry_block = dfg.make_block();
+        Self { name: "globals".to_owned(), id: None, entry_block, dfg }
     }
 
     /// Creates a new function as a clone of the one passed in with the passed in id.
     pub(crate) fn clone_with_id(id: FunctionId, another: &Function) -> Self {
         let dfg = another.dfg.clone();
         let entry_block = another.entry_block;
-        Self { name: another.name.clone(), id, entry_block, dfg, runtime: another.runtime }
+        Self { name: another.name.clone(), id: Some(id), entry_block, dfg }
+    }
+
+    /// Takes the signature (function name & runtime) from a function but does not copy the body.
+    pub(crate) fn clone_signature(id: FunctionId, another: &Function) -> Self {
+        let mut new_function = Function::new(another.name.clone(), id);
+        new_function.set_runtime(another.runtime());
+        new_function.set_globals(another.dfg.globals.clone());
+        new_function.dfg.set_function_purities(another.dfg.function_purities.clone());
+        new_function.dfg.brillig_arrays_offset = another.dfg.brillig_arrays_offset;
+        new_function
     }
 
     /// The name of the function.
     /// Used exclusively for debugging purposes.
-    pub(crate) fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
     /// The id of the function.
     pub(crate) fn id(&self) -> FunctionId {
-        self.id
+        self.id.expect("FunctionId should be initialized")
     }
 
     /// Runtime type of the function.
     pub(crate) fn runtime(&self) -> RuntimeType {
-        self.runtime
+        self.dfg.runtime()
     }
 
     /// Set runtime type of the function.
     pub(crate) fn set_runtime(&mut self, runtime: RuntimeType) {
-        self.runtime = runtime;
+        self.dfg.set_runtime(runtime);
+    }
+
+    pub(crate) fn set_globals(&mut self, globals: Arc<GlobalsGraph>) {
+        self.dfg.globals = globals;
     }
 
     pub(crate) fn is_no_predicates(&self) -> bool {
-        match self.runtime() {
-            RuntimeType::Acir(inline_type) => matches!(inline_type, InlineType::NoPredicates),
-            RuntimeType::Brillig => false,
-        }
+        self.runtime().is_no_predicates()
     }
 
     /// Retrieves the entry block of a function.
@@ -116,18 +183,16 @@ impl Function {
     }
 
     /// Returns the return types of this function.
-    pub(crate) fn returns(&self) -> &[ValueId] {
-        let blocks = self.reachable_blocks();
-        let mut function_return_values = None;
-        for block in blocks {
+    /// None might be returned if the function ends up with all of its block
+    /// terminators being `jmp`, `jmpif` or `unreachable`.
+    pub(crate) fn returns(&self) -> Option<&[ValueId]> {
+        for block in self.reachable_blocks() {
             let terminator = self.dfg[block].terminator();
             if let Some(TerminatorInstruction::Return { return_values, .. }) = terminator {
-                function_return_values = Some(return_values);
-                break;
+                return Some(return_values);
             }
         }
-        function_return_values
-            .expect("Expected a return instruction, as function construction is finished")
+        None
     }
 
     /// Collects all the reachable blocks of this function.
@@ -149,8 +214,41 @@ impl Function {
 
     pub(crate) fn signature(&self) -> Signature {
         let params = vecmap(self.parameters(), |param| self.dfg.type_of_value(*param));
-        let returns = vecmap(self.returns(), |ret| self.dfg.type_of_value(*ret));
+        let returns =
+            vecmap(self.returns().unwrap_or_default(), |ret| self.dfg.type_of_value(*ret));
         Signature { params, returns }
+    }
+
+    /// Finds the block of the function with the Return instruction
+    pub(crate) fn find_last_block(&self) -> BasicBlockId {
+        for block in self.reachable_blocks() {
+            if matches!(self.dfg[block].terminator(), Some(TerminatorInstruction::Return { .. })) {
+                return block;
+            }
+        }
+
+        unreachable!("SSA Function {} has no reachable return instruction!", self.id())
+    }
+
+    /// Total number of instructions in the reachable blocks of this function.
+    pub(crate) fn num_instructions(&self) -> usize {
+        self.reachable_blocks()
+            .iter()
+            .map(|block| {
+                let block = &self.dfg[*block];
+                block.instructions().len() + usize::from(block.terminator().is_some())
+            })
+            .sum()
+    }
+
+    pub fn view(&self) -> FunctionView {
+        FunctionView(self)
+    }
+}
+
+impl Clone for Function {
+    fn clone(&self) -> Self {
+        Function::clone_with_id(self.id(), self)
     }
 }
 
@@ -158,8 +256,75 @@ impl std::fmt::Display for RuntimeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RuntimeType::Acir(inline_type) => write!(f, "acir({inline_type})"),
-            RuntimeType::Brillig => write!(f, "brillig"),
+            RuntimeType::Brillig(inline_type) => write!(f, "brillig({inline_type})"),
         }
+    }
+}
+
+/// Provide public access to certain aspects of a `Function` without bloating its API.
+pub struct FunctionView<'a>(&'a Function);
+
+impl<'a> FunctionView<'a> {
+    /// Iterate over every Value in this DFG in no particular order, including unused Values,
+    /// for testing purposes.
+    pub fn values_iter(&self) -> impl DoubleEndedIterator<Item = (ValueId, &'a Value)> {
+        self.0.dfg.values_iter()
+    }
+
+    /// Iterate over the blocks in the CFG in reverse-post-order.
+    pub fn blocks_iter(&self) -> impl ExactSizeIterator<Item = BasicBlockId> {
+        let post_order = PostOrder::with_function(self.0);
+        post_order.into_vec_reverse().into_iter()
+    }
+
+    /// Iterate over the successors of a blocks.
+    pub fn block_successors_iter(
+        &self,
+        block_id: BasicBlockId,
+    ) -> impl ExactSizeIterator<Item = BasicBlockId> {
+        let block = &self.0.dfg[block_id];
+        block.successors()
+    }
+
+    /// Iterate over the functions called from a block.
+    pub fn block_callees_iter(&self, block_id: BasicBlockId) -> impl Iterator<Item = FunctionId> {
+        let block = &self.0.dfg[block_id];
+        block.instructions().iter().map(|id| &self.0.dfg[*id]).filter_map(|instruction| {
+            let Instruction::Call { func, .. } = instruction else {
+                return None;
+            };
+            let Value::Function(func) = self.0.dfg[*func] else {
+                return None;
+            };
+            Some(func)
+        })
+    }
+
+    /// Iterate over the numeric constants in the function.
+    pub fn constants(&self) -> impl Iterator<Item = (&FieldElement, &NumericType)> {
+        let local = self.0.dfg.values_iter();
+        let global = self.0.dfg.globals.values_iter();
+        local.chain(global).filter_map(|(_, value)| {
+            if let Value::NumericConstant { constant, typ } = value {
+                Some((constant, typ))
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn has_data_bus_return_data(&self) -> bool {
+        self.0.dfg.data_bus.return_data.is_some()
+    }
+
+    /// Return the types of the function parameters.
+    pub fn parameter_types(&self) -> Vec<Type> {
+        vecmap(self.0.parameters(), |p| self.0.dfg.type_of_value(*p))
+    }
+
+    /// Return the types of the returned values, if there are any.
+    pub fn return_types(&self) -> Option<Vec<Type>> {
+        self.0.returns().map(|rs| vecmap(rs, |p| self.0.dfg.type_of_value(*p)))
     }
 }
 
@@ -175,16 +340,10 @@ pub(crate) struct Signature {
     pub(crate) returns: Vec<Type>,
 }
 
-impl std::fmt::Display for Function {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        super::printer::display_function(self, f)
-    }
-}
-
 #[test]
 fn sign_smoke() {
     let mut signature = Signature::default();
 
-    signature.params.push(Type::Numeric(super::types::NumericType::NativeField));
-    signature.returns.push(Type::Numeric(super::types::NumericType::Unsigned { bit_size: 32 }));
+    signature.params.push(Type::Numeric(NumericType::NativeField));
+    signature.returns.push(Type::Numeric(NumericType::Unsigned { bit_size: 32 }));
 }

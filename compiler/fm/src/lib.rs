@@ -1,9 +1,8 @@
 #![forbid(unsafe_code)]
 #![warn(unused_crate_dependencies, unused_extern_crates)]
-#![warn(unreachable_pub)]
-#![warn(clippy::semicolon_if_nothing_returned)]
 
 mod file_map;
+mod simple_files;
 
 pub use file_map::{File, FileId, FileMap, PathString};
 
@@ -79,6 +78,11 @@ impl FileManager {
         Some(file_id)
     }
 
+    /// Replaces the source code of an existing file.
+    pub fn replace_file(&mut self, file_id: FileId, source: String) {
+        self.file_map.replace_file(file_id, source);
+    }
+
     fn register_path(&mut self, file_id: FileId, path: PathBuf) {
         let old_value = self.id_to_path.insert(file_id, path.clone());
         assert!(
@@ -100,13 +104,18 @@ impl FileManager {
         self.id_to_path.get(&file_id).map(|path| path.as_path())
     }
 
+    pub fn has_file(&self, file_name: &Path) -> bool {
+        let file_name = self.root.join(file_name);
+        self.name_to_id(file_name).is_some()
+    }
+
     // TODO: This should accept a &Path instead of a PathBuf
     pub fn name_to_id(&self, file_name: PathBuf) -> Option<FileId> {
         self.file_map.get_file_id(&PathString::from_path(file_name))
     }
 
     /// Find a file by its path suffix, e.g. "src/main.nr" is a suffix of
-    /// "some_dir/package_name/src/main.nr"`
+    /// "some_dir/package_name/src/main.nr"
     pub fn find_by_path_suffix(&self, suffix: &str) -> Result<Option<FileId>, Vec<PathBuf>> {
         let suffix_path: Vec<_> = Path::new(suffix).components().rev().collect();
         let results: Vec<_> = self
@@ -129,8 +138,9 @@ impl FileManager {
 pub trait NormalizePath {
     /// Replacement for `std::fs::canonicalize` that doesn't verify the path exists.
     ///
-    /// Plucked from https://github.com/rust-lang/cargo/blob/fede83ccf973457de319ba6fa0e36ead454d2e20/src/cargo/util/paths.rs#L61
-    /// Advice from https://www.reddit.com/r/rust/comments/hkkquy/comment/fwtw53s/
+    /// Plucked from <https://github.com/rust-lang/cargo/blob/fede83ccf973457de319ba6fa0e36ead454d2e20/src/cargo/util/paths.rs#L61>
+    ///
+    /// Advice from <https://www.reddit.com/r/rust/comments/hkkquy/comment/fwtw53s/>
     fn normalize(&self) -> PathBuf;
 }
 

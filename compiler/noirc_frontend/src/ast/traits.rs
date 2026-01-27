@@ -1,14 +1,18 @@
 use std::fmt::Display;
 
 use iter_extended::vecmap;
-use noirc_errors::Span;
+use noirc_errors::Location;
 
 use crate::ast::{
     BlockExpression, Expression, FunctionReturnType, Ident, NoirFunction, Path, UnresolvedGenerics,
     UnresolvedType,
 };
-use crate::macros_api::SecondaryAttribute;
-use crate::node_interner::TraitId;
+use crate::token::SecondaryAttribute;
+
+use super::{
+    Documented, GenericTypeArgs, IdentOrQuotedType, ItemVisibility, UnresolvedGeneric,
+    UnresolvedTypeData,
+};
 
 /// AST node for trait definitions:
 /// `trait name<generics> { ... items ... }`
@@ -16,10 +20,13 @@ use crate::node_interner::TraitId;
 pub struct NoirTrait {
     pub name: Ident,
     pub generics: UnresolvedGenerics,
+    pub bounds: Vec<TraitBound>,
     pub where_clause: Vec<UnresolvedTraitConstraint>,
-    pub span: Span,
-    pub items: Vec<TraitItem>,
+    pub location: Location,
+    pub items: Vec<Documented<TraitItem>>,
     pub attributes: Vec<SecondaryAttribute>,
+    pub visibility: ItemVisibility,
+    pub is_alias: bool,
 }
 
 /// Any declaration inside the body of a trait that a user is required to
@@ -27,6 +34,9 @@ pub struct NoirTrait {
 #[derive(Clone, Debug)]
 pub enum TraitItem {
     Function {
+        is_unconstrained: bool,
+        visibility: ItemVisibility,
+        is_comptime: bool,
         name: Ident,
         generics: UnresolvedGenerics,
         parameters: Vec<(Ident, UnresolvedType)>,
@@ -36,11 +46,11 @@ pub enum TraitItem {
     },
     Constant {
         name: Ident,
-        typ: UnresolvedType,
-        default_value: Option<Expression>,
+        typ: Option<UnresolvedType>,
     },
     Type {
         name: Ident,
+        bounds: Vec<TraitBound>,
     },
 }
 
@@ -49,10 +59,10 @@ pub enum TraitItem {
 #[derive(Clone, Debug)]
 pub struct TypeImpl {
     pub object_type: UnresolvedType,
-    pub type_span: Span,
+    pub type_location: Location,
     pub generics: UnresolvedGenerics,
     pub where_clause: Vec<UnresolvedTraitConstraint>,
-    pub methods: Vec<(NoirFunction, Span)>,
+    pub methods: Vec<(Documented<NoirFunction>, Location)>,
 }
 
 /// Ast node for an implementation of a trait for a particular type
@@ -61,14 +71,16 @@ pub struct TypeImpl {
 pub struct NoirTraitImpl {
     pub impl_generics: UnresolvedGenerics,
 
-    pub trait_name: Path,
-    pub trait_generics: Vec<UnresolvedType>,
+    pub r#trait: UnresolvedType,
 
     pub object_type: UnresolvedType,
 
     pub where_clause: Vec<UnresolvedTraitConstraint>,
 
-    pub items: Vec<TraitImplItem>,
+    pub items: Vec<Documented<TraitImplItem>>,
+
+    /// true if generated at compile-time, e.g. from a trait alias
+    pub is_synthetic: bool,
 }
 
 /// Represents a simple trait constraint such as `where Foo: TraitY<U, V>`
@@ -87,21 +99,27 @@ pub struct UnresolvedTraitConstraint {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TraitBound {
     pub trait_path: Path,
-    pub trait_id: Option<TraitId>, // initially None, gets assigned during DC
-    pub trait_generics: Vec<UnresolvedType>,
+    pub trait_generics: GenericTypeArgs,
 }
 
 #[derive(Clone, Debug)]
-pub enum TraitImplItem {
+pub struct TraitImplItem {
+    pub kind: TraitImplItemKind,
+    pub location: Location,
+}
+
+#[derive(Clone, Debug)]
+pub enum TraitImplItemKind {
     Function(NoirFunction),
-    Constant(Ident, UnresolvedType, Expression),
-    Type { name: Ident, alias: UnresolvedType },
+    Constant(Ident, Option<UnresolvedType>, Expression),
+    Type { name: Ident, alias: Option<UnresolvedType> },
 }
 
 impl Display for TypeImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let generics = vecmap(&self.generics, |generic| generic.to_string());
-        let generics = if generics.is_empty() { "".into() } else { generics.join(", ") };
+        let generics =
+            if generics.is_empty() { "".into() } else { format!("<{}>", generics.join(", ")) };
 
         writeln!(f, "impl{} {} {{", generics, self.object_type)?;
 
@@ -116,12 +134,31 @@ impl Display for TypeImpl {
     }
 }
 
+// TODO(https://github.com/noir-lang/noir/issues/8306): display where clauses
 impl Display for NoirTrait {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let generics = vecmap(&self.generics, |generic| generic.to_string());
-        let generics = if generics.is_empty() { "".into() } else { generics.join(", ") };
+        let generics =
+            if generics.is_empty() { "".into() } else { format!("<{}>", generics.join(", ")) };
 
-        writeln!(f, "trait {}{} {{", self.name, generics)?;
+        write!(f, "trait {}{}", self.name, generics)?;
+
+        if self.is_alias {
+            let bounds = vecmap(&self.bounds, |bound| bound.to_string()).join(" + ");
+            return write!(f, " = {bounds};");
+        }
+
+        if !self.bounds.is_empty() {
+            let bounds = vecmap(&self.bounds, |bound| bound.to_string()).join(" + ");
+            write!(f, ": {bounds}")?;
+        }
+
+        let where_clause = vecmap(&self.where_clause, ToString::to_string);
+        if !where_clause.is_empty() {
+            write!(f, " where {}", where_clause.join(", "))?;
+        };
+
+        writeln!(f, " {{")?;
 
         for item in self.items.iter() {
             let item = item.to_string();
@@ -137,7 +174,17 @@ impl Display for NoirTrait {
 impl Display for TraitItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TraitItem::Function { name, generics, parameters, return_type, where_clause, body } => {
+            TraitItem::Function {
+                name,
+                generics,
+                parameters,
+                return_type,
+                where_clause,
+                body,
+                is_unconstrained,
+                visibility,
+                is_comptime,
+            } => {
                 let generics = vecmap(generics, |generic| generic.to_string());
                 let parameters = vecmap(parameters, |(name, typ)| format!("{name}: {typ}"));
                 let where_clause = vecmap(where_clause, ToString::to_string);
@@ -146,27 +193,36 @@ impl Display for TraitItem {
                 let parameters = parameters.join(", ");
                 let where_clause = where_clause.join(", ");
 
+                let unconstrained = if *is_unconstrained { "unconstrained " } else { "" };
+                let visibility = if *visibility == ItemVisibility::Private {
+                    "".to_string()
+                } else {
+                    format!("{visibility} ")
+                };
+                let is_comptime = if *is_comptime { "comptime " } else { "" };
+
                 write!(
                     f,
-                    "fn {name}<{generics}>({parameters}) -> {return_type} where {where_clause}"
+                    "{unconstrained}{visibility}{is_comptime}fn {name}<{generics}>({parameters}) -> {return_type} where {where_clause}"
                 )?;
 
-                if let Some(body) = body {
-                    write!(f, "{body}")
+                if let Some(body) = body { write!(f, "{body}") } else { write!(f, ";") }
+            }
+            TraitItem::Constant { name, typ } => {
+                if let Some(typ) = typ {
+                    write!(f, "let {name}: {typ};")
                 } else {
-                    write!(f, ";")
+                    write!(f, "let {name};")
                 }
             }
-            TraitItem::Constant { name, typ, default_value } => {
-                write!(f, "let {name}: {typ}")?;
-
-                if let Some(default_value) = default_value {
-                    write!(f, "{default_value};")
+            TraitItem::Type { name, bounds } => {
+                if bounds.is_empty() {
+                    write!(f, "type {name};")
                 } else {
-                    write!(f, ";")
+                    let bounds = vecmap(bounds, |bound| bound.to_string()).join(" + ");
+                    write!(f, "type {name}: {bounds};")
                 }
             }
-            TraitItem::Type { name } => write!(f, "type {name};"),
         }
     }
 }
@@ -179,21 +235,35 @@ impl Display for UnresolvedTraitConstraint {
 
 impl Display for TraitBound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let generics = vecmap(&self.trait_generics, |generic| generic.to_string());
-        if !generics.is_empty() {
-            write!(f, "{}<{}>", self.trait_path, generics.join(", "))
-        } else {
-            write!(f, "{}", self.trait_path)
-        }
+        write!(f, "{}{}", self.trait_path, self.trait_generics)
     }
 }
 
 impl Display for NoirTraitImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let generics = vecmap(&self.trait_generics, |generic| generic.to_string());
-        let generics = generics.join(", ");
+        // Synthetic NoirTraitImpl's don't get printed
+        if self.is_synthetic {
+            return Ok(());
+        }
 
-        writeln!(f, "impl {}<{}> for {} {{", self.trait_name, generics, self.object_type)?;
+        write!(f, "impl")?;
+        if !self.impl_generics.is_empty() {
+            write!(
+                f,
+                "<{}>",
+                self.impl_generics.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            )?;
+        }
+
+        write!(f, " {} for {}", self.r#trait, self.object_type)?;
+        if !self.where_clause.is_empty() {
+            write!(
+                f,
+                " where {}",
+                self.where_clause.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            )?;
+        }
+        writeln!(f, "{{")?;
 
         for item in self.items.iter() {
             let item = item.to_string();
@@ -208,12 +278,98 @@ impl Display for NoirTraitImpl {
 
 impl Display for TraitImplItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+
+impl Display for TraitImplItemKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TraitImplItem::Function(function) => function.fmt(f),
-            TraitImplItem::Type { name, alias } => write!(f, "type {name} = {alias};"),
-            TraitImplItem::Constant(name, typ, value) => {
-                write!(f, "let {name}: {typ} = {value};")
+            TraitImplItemKind::Function(function) => function.fmt(f),
+            TraitImplItemKind::Type { name, alias } => {
+                if let Some(alias) = alias {
+                    write!(f, "type {name} = {alias};")
+                } else {
+                    write!(f, "type {name};")
+                }
+            }
+            TraitImplItemKind::Constant(name, typ, value) => {
+                if let Some(typ) = typ {
+                    write!(f, "let {name}: {typ} = {value};")
+                } else {
+                    write!(f, "let {name} = {value};")
+                }
             }
         }
     }
+}
+
+/// Does both `desugar_generic_trait_bounds` and `reorder_where_clause`.
+pub(crate) fn desugar_generic_trait_bounds_and_reorder_where_clause(
+    generics: &mut Vec<UnresolvedGeneric>,
+    where_clause: &mut Vec<UnresolvedTraitConstraint>,
+) {
+    desugar_generic_trait_bounds(generics, where_clause);
+    reorder_where_clause(where_clause);
+}
+
+/// Moves trait bounds from generics into where clauses. For example:
+///
+/// ```noir
+/// fn foo<T: Trait>(x: T) -> T {}
+/// ```
+///
+/// becomes:
+///
+/// ```noir
+/// fn foo<T>(x: T) -> T where T: Trait {}
+/// ```
+fn desugar_generic_trait_bounds(
+    generics: &mut Vec<UnresolvedGeneric>,
+    where_clause: &mut Vec<UnresolvedTraitConstraint>,
+) {
+    for generic in generics {
+        let UnresolvedGeneric::Variable(IdentOrQuotedType::Ident(ident), trait_bounds) = generic
+        else {
+            continue;
+        };
+
+        if trait_bounds.is_empty() {
+            continue;
+        }
+
+        for trait_bound in std::mem::take(trait_bounds) {
+            let path = Path::from_ident(ident.clone());
+            let typ = UnresolvedTypeData::Named(path, GenericTypeArgs::default(), true);
+            let typ = UnresolvedType { typ, location: ident.location() };
+            let trait_constraint = UnresolvedTraitConstraint { typ, trait_bound };
+            where_clause.push(trait_constraint);
+        }
+    }
+}
+
+/// Reorders a where clause in-place so that simpler constraints come before more complex ones.
+/// The resulting where clause will have constraints in this order:
+/// 1. Paths without generics
+/// 2. Paths with generics
+/// 3. Everything else
+fn reorder_where_clause(where_clause: &mut Vec<UnresolvedTraitConstraint>) {
+    let mut paths_without_generics = Vec::new();
+    let mut paths_with_generics = Vec::new();
+    let mut others = Vec::new();
+
+    for clause in std::mem::take(where_clause) {
+        if let UnresolvedTypeData::Named(_, generics, _) = &clause.typ.typ {
+            if generics.is_empty() {
+                paths_without_generics.push(clause);
+            } else {
+                paths_with_generics.push(clause);
+            }
+        } else {
+            others.push(clause);
+        }
+    }
+    where_clause.extend(paths_without_generics);
+    where_clause.extend(paths_with_generics);
+    where_clause.extend(others);
 }

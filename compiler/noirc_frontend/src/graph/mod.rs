@@ -16,31 +16,30 @@ pub enum CrateId {
     Root(usize),
     Crate(usize),
     Stdlib(usize),
-    Dummy,
+    /// The special case of running the compiler against the stdlib.
+    /// In that case there's only one crate, and it's both the root
+    /// crate and the stdlib crate.
+    RootAndStdlib(usize),
 }
 
 impl CrateId {
-    pub fn dummy_id() -> CrateId {
-        CrateId::Dummy
-    }
-
     pub fn is_stdlib(&self) -> bool {
-        matches!(self, CrateId::Stdlib(_))
+        match self {
+            CrateId::Stdlib(_) | CrateId::RootAndStdlib(_) => true,
+            CrateId::Root(_) | CrateId::Crate(_) => false,
+        }
     }
 
     pub fn is_root(&self) -> bool {
-        matches!(self, CrateId::Root(_))
+        match self {
+            CrateId::Root(_) | CrateId::RootAndStdlib(_) => true,
+            CrateId::Stdlib(_) | CrateId::Crate(_) => false,
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct CrateName(SmolStr);
-
-impl CrateName {
-    fn is_valid_name(name: &str) -> bool {
-        !name.is_empty() && name.chars().all(|n| !CHARACTER_BLACK_LIST.contains(&n))
-    }
-}
 
 impl Display for CrateName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -59,36 +58,72 @@ impl From<&CrateName> for String {
     }
 }
 
-/// Creates a new CrateName rejecting any crate name that
-/// has a character on the blacklist.
-/// The difference between RA and this implementation is that
-/// characters on the blacklist are never allowed; there is no normalization.
+/// Creates a new CrateName rejecting any invalid crate name.
+/// Valid crate names are ones that are also valid Noir identifiers:
+/// they must start with an ASCII alphabetic character or '_' (underscore),
+/// then continue with ASCII alphanumeric characters or '_' (underscore).
+/// In Rust '-' is also allowed, but we disallow it as it's similar to '_'
+/// and we do not want names that differ by a hyphen.
 impl FromStr for CrateName {
     type Err = String;
 
     fn from_str(name: &str) -> Result<Self, Self::Err> {
-        if Self::is_valid_name(name) {
-            Ok(Self(SmolStr::new(name)))
-        } else {
-            Err("Package names must be non-empty and cannot contain hyphens".into())
+        if name.is_empty() {
+            return Err("an empty name is not a valid package name".to_string());
         }
+
+        for (index, char) in name.chars().enumerate() {
+            if index == 0 {
+                if !(char.is_ascii_alphabetic() || char == '_') {
+                    if char.is_ascii_digit() {
+                        return Err(format!(
+                            "invalid character '{char}' in package name \"{name}\", the name cannot start with a digit"
+                        ));
+                    } else {
+                        return Err(format!(
+                            "invalid character '{char}' in package name \"{name}\", the first character must be an ASCII alphabetic character or '_' (underscore)"
+                        ));
+                    }
+                }
+            } else if !(char.is_ascii_alphanumeric() || char == '_') {
+                return Err(format!(
+                    "invalid character '{char}' in package name \"{name}\", characters must be ASCII alphanumeric characters or '_' (underscore)"
+                ));
+            }
+        }
+
+        Ok(Self(SmolStr::new(name)))
     }
 }
 
 #[cfg(test)]
 mod crate_name {
-    use super::{CrateName, CHARACTER_BLACK_LIST};
+    use std::str::FromStr;
+
+    use super::CrateName;
 
     #[test]
     fn it_rejects_empty_string() {
-        assert!(!CrateName::is_valid_name(""));
+        assert!(CrateName::from_str("").is_err());
     }
 
     #[test]
-    fn it_rejects_blacklisted_chars() {
-        for bad_char in CHARACTER_BLACK_LIST {
-            let bad_char_string = bad_char.to_string();
-            assert!(!CrateName::is_valid_name(&bad_char_string));
+    fn it_rejects_number_as_the_first_char() {
+        assert!(CrateName::from_str("1hello").is_err());
+    }
+
+    #[test]
+    fn it_rejects_some_chars_in_the_middle_of_the_name() {
+        for bad_char in [' ', '-', '!', '@', '/'] {
+            let name = format!("hello{bad_char}world");
+            assert!(CrateName::from_str(&name).is_err());
+        }
+    }
+
+    #[test]
+    fn it_allows_a_few_valid_name() {
+        for name in ["one", "one1", "one_two", "_one"] {
+            assert!(CrateName::from_str(name).is_ok());
         }
     }
 
@@ -103,10 +138,40 @@ pub struct CrateGraph {
     arena: FxHashMap<CrateId, CrateData>,
 }
 
-/// List of characters that are not allowed in a crate name
-/// For example, Hyphen(-) is disallowed as it is similar to underscore(_)
-/// and we do not want names that differ by a hyphen
-pub const CHARACTER_BLACK_LIST: [char; 1] = ['-'];
+impl CrateGraph {
+    /// Tries to find the requested crate in the current one's dependencies,
+    /// otherwise walks down the crate dependency graph from crate_id until we reach it.
+    /// This is needed in case a library (`lib1`) re-export a structure defined in another library (`lib2`)
+    /// In that case, we will get `[lib1,lib2]` when looking for a struct defined in lib2,
+    /// re-exported by lib1 and used by the main crate.
+    /// Returns the path from crate_id to target_crate_id
+    pub(crate) fn find_dependencies(
+        &self,
+        crate_id: &CrateId,
+        target_crate_id: &CrateId,
+    ) -> Option<Vec<String>> {
+        self[crate_id]
+            .dependencies
+            .iter()
+            .find_map(|dep| {
+                if &dep.crate_id == target_crate_id {
+                    Some(vec![dep.name.to_string()])
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self[crate_id].dependencies.iter().find_map(|dep| {
+                    if let Some(mut path) = self.find_dependencies(&dep.crate_id, target_crate_id) {
+                        path.insert(0, dep.name.to_string());
+                        Some(path)
+                    } else {
+                        None
+                    }
+                })
+            })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrateData {
@@ -178,11 +243,8 @@ impl CrateGraph {
             Some((CrateId::Root(_), _)) => {
                 panic!("ICE: Tried to re-add the root crate as a regular crate")
             }
-            Some((CrateId::Stdlib(_), _)) => {
+            Some((CrateId::Stdlib(_), _)) | Some((CrateId::RootAndStdlib(_), _)) => {
                 panic!("ICE: Tried to re-add the stdlib crate as a regular crate")
-            }
-            Some((CrateId::Dummy, _)) => {
-                panic!("ICE: A dummy CrateId should not exist in the CrateGraph")
             }
             None => {
                 let data = CrateData { root_file_id: file_id, dependencies: Vec::new() };
@@ -207,6 +269,28 @@ impl CrateGraph {
 
         let data = CrateData { root_file_id: file_id, dependencies: Vec::new() };
         let crate_id = CrateId::Stdlib(self.arena.len());
+        let prev = self.arena.insert(crate_id, data);
+        assert!(prev.is_none());
+        crate_id
+    }
+
+    pub fn add_crate_root_and_stdlib(&mut self, file_id: FileId) -> CrateId {
+        for (crate_id, crate_data) in self.arena.iter() {
+            if crate_id.is_root() {
+                panic!("ICE: Cannot add two crate roots to a graph - use `add_crate` instead");
+            }
+
+            if crate_id.is_stdlib() {
+                panic!("ICE: Cannot add two stdlib crates to a graph - use `add_crate` instead");
+            }
+
+            if crate_data.root_file_id == file_id {
+                panic!("ICE: This FileId was already added to the CrateGraph")
+            }
+        }
+
+        let data = CrateData { root_file_id: file_id, dependencies: Vec::new() };
+        let crate_id = CrateId::RootAndStdlib(self.arena.len());
         let prev = self.arena.insert(crate_id, data);
         assert!(prev.is_none());
         crate_id
@@ -312,7 +396,7 @@ mod tests {
     use super::{CrateGraph, FileId};
 
     fn dummy_file_ids(n: usize) -> Vec<FileId> {
-        use fm::{FileMap, FILE_EXTENSION};
+        use fm::{FILE_EXTENSION, FileMap};
         let mut fm = FileMap::default();
 
         let mut vec_ids = Vec::with_capacity(n);

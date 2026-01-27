@@ -1,6 +1,5 @@
 // Tests the copy on write optimization for arrays. We look for cases where we are modifying an array in place when we shouldn't.
-
-global ARRAY_SIZE = 5;
+global ARRAY_SIZE: u32 = 5;
 
 struct ExecutionResult {
     original: [Field; ARRAY_SIZE],
@@ -16,21 +15,21 @@ impl ExecutionResult {
     }
 }
 
-fn modify_in_inlined_constrained(original: [Field; ARRAY_SIZE], index: u64) -> ExecutionResult {
+fn modify_in_inlined_constrained(original: [Field; ARRAY_SIZE], index: u32) -> ExecutionResult {
     let mut modified = original;
 
     modified[index] = 27;
 
     let modified_once = modified;
 
-    modified[index+1] = 27;
+    modified[index + 1] = 27;
 
     ExecutionResult { original, modified_once, modified_twice: modified }
 }
 
 unconstrained fn modify_in_unconstrained(
     original: [Field; ARRAY_SIZE],
-    index: u64
+    index: u32,
 ) -> ExecutionResult {
     let mut modified = original;
 
@@ -38,12 +37,12 @@ unconstrained fn modify_in_unconstrained(
 
     let modified_once = modified;
 
-    modified[index+1] = 27;
+    modified[index + 1] = 27;
 
     ExecutionResult { original, modified_once, modified_twice: modified }
 }
 
-unconstrained fn main(original: [Field; ARRAY_SIZE], index: u64, expected_result: ExecutionResult) {
+unconstrained fn main(original: [Field; ARRAY_SIZE], index: u32, expected_result: ExecutionResult) {
     assert(expected_result.is_equal(modify_in_unconstrained(original, index)));
     assert(expected_result.is_equal(modify_in_inlined_constrained(original, index)));
 }

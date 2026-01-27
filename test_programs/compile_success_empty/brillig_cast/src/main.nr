@@ -1,18 +1,14 @@
 // Tests a very simple Brillig function.
-// 
+//
 // The features being tested are cast operations on brillig
 fn main() {
-    bool_casts();
-    field_casts();
-    uint_casts();
-    int_casts();
-    mixed_casts();
-}
-
-unconstrained fn bool_casts() {
-    assert(false == 0 as bool);
-    assert(true == 1 as bool);
-    assert(true == 3 as bool);
+    // Safety: testing context
+    unsafe {
+        field_casts();
+        uint_casts();
+        int_casts();
+        mixed_casts();
+    }
 }
 
 unconstrained fn field_casts() {
@@ -29,13 +25,12 @@ unconstrained fn uint_casts() {
 
 unconstrained fn int_casts() {
     let x: i32 = 456;
-    assert(x as i8 == -56 as i8);
+    assert(x as i8 == -(56 as i8));
     assert(x as i64 == 456);
 }
 
 unconstrained fn mixed_casts() {
     assert(100 as u32 as i32 as u32 == 100);
     assert(257 as u8 as u32 == 1);
-    assert(1 as u8 as bool == true);
     assert(true as i8 == 1);
 }

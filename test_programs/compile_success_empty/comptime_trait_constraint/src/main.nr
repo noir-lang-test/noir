@@ -5,8 +5,7 @@ trait TraitWithGenerics<A, B> {
 }
 
 fn main() {
-    comptime
-    {
+    comptime {
         let constraint1 = quote { Default }.as_trait_constraint();
         let constraint2 = quote { TraitWithGenerics<Field, u32> }.as_trait_constraint();
 
@@ -32,7 +31,7 @@ impl Hasher for TestHasher {
     fn finish(self) -> Field {
         self.result
     }
-    
+
     fn write(&mut self, input: Field) {
         self.result += input;
     }

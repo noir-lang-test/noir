@@ -1,10 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::ssa::{
     ir::{
-        basic_block::BasicBlockId,
         function::Function,
-        instruction::{Instruction, InstructionId, TerminatorInstruction},
+        instruction::{Instruction, InstructionId},
         types::Type,
         value::ValueId,
     },
@@ -23,7 +22,7 @@ impl Ssa {
     #[tracing::instrument(level = "trace", skip(self))]
     pub(crate) fn remove_paired_rc(mut self) -> Ssa {
         for function in self.functions.values_mut() {
-            remove_paired_rc(function);
+            function.remove_paired_rc();
         }
         self
     }
@@ -36,38 +35,45 @@ struct Context {
     //
     // The type of the array being operated on is recorded.
     // If an array_set to that array type is encountered, that is also recorded.
-    inc_rcs: HashMap<Type, Vec<IncRc>>,
+    inc_rcs: HashMap<Type, Vec<RcInstruction>>,
 }
 
-struct IncRc {
+struct RcInstruction {
     id: InstructionId,
     array: ValueId,
     possibly_mutated: bool,
 }
 
-/// This function is very simplistic for now. It takes advantage of the fact that dec_rc
-/// instructions are currently issued only at the end of a function for parameters and will
-/// only check the first and last block for inc & dec rc instructions to be removed. The rest
-/// of the function is still checked for array_set instructions.
-///
-/// This restriction lets this function largely ignore merging intermediate results from other
-/// blocks and handling loops.
-fn remove_paired_rc(function: &mut Function) {
-    // `dec_rc` is only issued for parameters currently so we can speed things
-    // up a bit by skipping any functions without them.
-    if !contains_array_parameter(function) {
-        return;
+impl Function {
+    /// This function is very simplistic for now. It takes advantage of the fact that dec_rc
+    /// instructions are currently issued only at the end of a function for parameters and will
+    /// only check the first and last block for inc & dec rc instructions to be removed. The rest
+    /// of the function is still checked for array_set instructions.
+    ///
+    /// This restriction lets this function largely ignore merging intermediate results from other
+    /// blocks and handling loops.
+    pub(crate) fn remove_paired_rc(&mut self) {
+        if !self.runtime().is_brillig() {
+            // dec_rc and inc_rc only have an effect in Brillig
+            return;
+        }
+
+        // `dec_rc` is only issued for parameters currently so we can speed things
+        // up a bit by skipping any functions without them.
+        if !contains_array_parameter(self) {
+            return;
+        }
+
+        let mut context = Context::default();
+
+        context.find_rcs_in_entry_block(self);
+        context.scan_for_array_sets(self);
+        let to_remove = context.find_rcs_to_remove(self);
+        remove_instructions(to_remove, self);
     }
-
-    let mut context = Context::default();
-
-    context.find_rcs_in_entry_block(function);
-    context.scan_for_array_sets(function);
-    let to_remove = context.find_rcs_to_remove(function);
-    remove_instructions(to_remove, function);
 }
 
-fn contains_array_parameter(function: &mut Function) -> bool {
+fn contains_array_parameter(function: &Function) -> bool {
     let mut parameters = function.parameters().iter();
     parameters.any(|parameter| function.dfg.type_of_value(*parameter).contains_an_array())
 }
@@ -81,7 +87,8 @@ impl Context {
                 let typ = function.dfg.type_of_value(*value);
 
                 // We assume arrays aren't mutated until we find an array_set
-                let inc_rc = IncRc { id: *instruction, array: *value, possibly_mutated: false };
+                let inc_rc =
+                    RcInstruction { id: *instruction, array: *value, possibly_mutated: false };
                 self.inc_rcs.entry(typ).or_default().push(inc_rc);
             }
         }
@@ -107,12 +114,12 @@ impl Context {
     /// Find each dec_rc instruction and if the most recent inc_rc instruction for the same value
     /// is not possibly mutated, then we can remove them both. Returns each such pair.
     fn find_rcs_to_remove(&mut self, function: &Function) -> HashSet<InstructionId> {
-        let last_block = Self::find_last_block(function);
-        let mut to_remove = HashSet::new();
+        let last_block = function.find_last_block();
+        let mut to_remove = HashSet::default();
 
         for instruction in function.dfg[last_block].instructions() {
-            if let Instruction::DecrementRc { value } = &function.dfg[*instruction] {
-                if let Some(inc_rc) = self.pop_rc_for(*value, function) {
+            if let Instruction::DecrementRc { value, .. } = &function.dfg[*instruction] {
+                if let Some(inc_rc) = pop_rc_for(*value, function, &mut self.inc_rcs) {
                     if !inc_rc.possibly_mutated {
                         to_remove.insert(inc_rc.id);
                         to_remove.insert(*instruction);
@@ -123,30 +130,20 @@ impl Context {
 
         to_remove
     }
+}
 
-    /// Finds the block of the function with the Return instruction
-    fn find_last_block(function: &Function) -> BasicBlockId {
-        for block in function.reachable_blocks() {
-            if matches!(
-                function.dfg[block].terminator(),
-                Some(TerminatorInstruction::Return { .. })
-            ) {
-                return block;
-            }
-        }
+/// Finds and pops the IncRc for the given array value if possible.
+fn pop_rc_for(
+    value: ValueId,
+    function: &Function,
+    inc_rcs: &mut HashMap<Type, Vec<RcInstruction>>,
+) -> Option<RcInstruction> {
+    let typ = function.dfg.type_of_value(value);
 
-        unreachable!("SSA Function {} has no reachable return instruction!", function.id())
-    }
+    let rcs = inc_rcs.get_mut(&typ)?;
+    let position = rcs.iter().position(|inc_rc| inc_rc.array == value)?;
 
-    /// Finds and pops the IncRc for the given array value if possible.
-    fn pop_rc_for(&mut self, value: ValueId, function: &Function) -> Option<IncRc> {
-        let typ = function.dfg.type_of_value(value);
-
-        let rcs = self.inc_rcs.get_mut(&typ)?;
-        let position = rcs.iter().position(|inc_rc| inc_rc.array == value)?;
-
-        Some(rcs.remove(position))
-    }
+    Some(rcs.remove(position))
 }
 
 fn remove_instructions(to_remove: HashSet<InstructionId>, function: &mut Function) {
@@ -160,14 +157,14 @@ fn remove_instructions(to_remove: HashSet<InstructionId>, function: &mut Functio
 }
 
 #[cfg(test)]
-mod test {
-    use std::rc::Rc;
+mod tests {
 
-    use crate::ssa::{
-        function_builder::FunctionBuilder,
-        ir::{
-            basic_block::BasicBlockId, dfg::DataFlowGraph, function::RuntimeType,
-            instruction::Instruction, map::Id, types::Type,
+    use crate::{
+        assert_ssa_snapshot,
+        ssa::{
+            ir::{basic_block::BasicBlockId, dfg::DataFlowGraph, instruction::Instruction},
+            opt::assert_ssa_does_not_change,
+            ssa_gen::Ssa,
         },
     };
 
@@ -197,30 +194,18 @@ mod test {
         // unconstrained fn foo(x: [Field; 2]) -> [[Field; 2]; 1] {
         //     [array]
         // }
-        //
-        // fn foo {
-        //   b0(v0: [Field; 2]):
-        //     inc_rc v0
-        //     inc_rc v0
-        //     dec_rc v0
-        //     return [v0]
-        // }
-        let main_id = Id::test_new(0);
-        let mut builder = FunctionBuilder::new("foo".into(), main_id);
-        builder.set_runtime(RuntimeType::Brillig);
-
-        let inner_array_type = Type::Array(Rc::new(vec![Type::field()]), 2);
-        let v0 = builder.add_parameter(inner_array_type.clone());
-
-        builder.insert_inc_rc(v0);
-        builder.insert_inc_rc(v0);
-        builder.insert_dec_rc(v0);
-
-        let outer_array_type = Type::Array(Rc::new(vec![inner_array_type]), 1);
-        let array = builder.array_constant(vec![v0].into(), outer_array_type);
-        builder.terminate_with_return(vec![array]);
-
-        let ssa = builder.finish().remove_paired_rc();
+        let src = "
+        brillig(inline) fn foo f0 {
+          b0(v0: [Field; 2]):
+            inc_rc v0
+            inc_rc v0
+            dec_rc v0
+            v1 = make_array [v0] : [[Field; 2]; 1]
+            return v1
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.remove_paired_rc();
         let main = ssa.main();
         let entry = main.entry_block();
 
@@ -233,38 +218,22 @@ mod test {
         // fn mutator(mut array: [Field; 2]) {
         //     array[0] = 5;
         // }
-        //
-        // fn mutator {
-        //   b0(v0: [Field; 2]):
-        //     v1 = allocate
-        //     store v0 at v1
-        //     inc_rc v0
-        //     v2 = load v1
-        //     v7 = array_set v2, index u64 0, value Field 5
-        //     store v7 at v1
-        //     dec_rc v0
-        //     return
-        // }
-        let main_id = Id::test_new(0);
-        let mut builder = FunctionBuilder::new("mutator".into(), main_id);
+        let src = "
+        brillig(inline) fn mutator f0 {
+          b0(v0: [Field; 2]):
+            v1 = allocate -> &mut [Field; 2]
+            store v0 at v1
+            inc_rc v0
+            v2 = load v1 -> [Field; 2]
+            v5 = array_set v2, index u32 0, value Field 5
+            store v5 at v1
+            dec_rc v0
+            return
+        }
+        ";
 
-        let array_type = Type::Array(Rc::new(vec![Type::field()]), 2);
-        let v0 = builder.add_parameter(array_type.clone());
-
-        let v1 = builder.insert_allocate(array_type.clone());
-        builder.insert_store(v1, v0);
-        builder.insert_inc_rc(v0);
-        let v2 = builder.insert_load(v1, array_type);
-
-        let zero = builder.numeric_constant(0u128, Type::unsigned(64));
-        let five = builder.field_constant(5u128);
-        let v7 = builder.insert_array_set(v2, zero, five);
-
-        builder.insert_store(v1, v7);
-        builder.insert_dec_rc(v0);
-        builder.terminate_with_return(vec![]);
-
-        let ssa = builder.finish().remove_paired_rc();
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.remove_paired_rc();
         let main = ssa.main();
         let entry = main.entry_block();
 
@@ -280,49 +249,198 @@ mod test {
         // fn mutator2(array: &mut [Field; 2]) {
         //     array[0] = 5;
         // }
-        //
-        // fn mutator2 {
-        //   b0(v0: &mut [Field; 2]):
-        //     v1 = load v0
-        //     inc_rc v1
-        //     store v1 at v0
-        //     v2 = load v0
-        //     v7 = array_set v2, index u64 0, value Field 5
-        //     store v7 at v0
-        //     v8 = load v0
-        //     dec_rc v8
-        //     store v8 at v0
-        //     return
-        // }
-        let main_id = Id::test_new(0);
-        let mut builder = FunctionBuilder::new("mutator2".into(), main_id);
+        let src = "
+        brillig(inline) fn mutator2 f0 {
+          b0(v0: &mut [Field; 2]):
+            v1 = load v0 -> [Field; 2]
+            inc_rc v1
+            store v1 at v0
+            v2 = load v1 -> [Field; 2]
+            v5 = array_set v2, index u32 0, value Field 5
+            store v5 at v0
+            v6 = load v0 -> [Field; 2]
+            dec_rc v1
+            store v6 at v0
+            return
+        }
+        ";
 
-        let array_type = Type::Array(Rc::new(vec![Type::field()]), 2);
-        let reference_type = Type::Reference(Rc::new(array_type.clone()));
-
-        let v0 = builder.add_parameter(reference_type);
-
-        let v1 = builder.insert_load(v0, array_type.clone());
-        builder.insert_inc_rc(v1);
-        builder.insert_store(v0, v1);
-
-        let v2 = builder.insert_load(v1, array_type.clone());
-        let zero = builder.numeric_constant(0u128, Type::unsigned(64));
-        let five = builder.field_constant(5u128);
-        let v7 = builder.insert_array_set(v2, zero, five);
-
-        builder.insert_store(v0, v7);
-        let v8 = builder.insert_load(v0, array_type);
-        builder.insert_dec_rc(v8);
-        builder.insert_store(v0, v8);
-        builder.terminate_with_return(vec![]);
-
-        let ssa = builder.finish().remove_paired_rc();
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.remove_paired_rc();
         let main = ssa.main();
         let entry = main.entry_block();
 
         // No changes, the array is possibly mutated
         assert_eq!(count_inc_rcs(entry, &main.dfg), 1);
         assert_eq!(count_dec_rcs(entry, &main.dfg), 1);
+    }
+
+    #[test]
+    fn lone_inc_rc() {
+        let src = "
+        brillig(inline) fn foo f0 {
+          b0(v0: [Field; 2]):
+            inc_rc v0
+            return v0
+        }
+        ";
+        assert_ssa_does_not_change(src, Ssa::remove_paired_rc);
+    }
+
+    #[test]
+    fn lone_dec_rc() {
+        let src = "
+        brillig(inline) fn foo f0 {
+          b0(v0: [Field; 2]):
+            dec_rc v0
+            return v0
+        }
+        ";
+        assert_ssa_does_not_change(src, Ssa::remove_paired_rc);
+    }
+
+    #[test]
+    fn multiple_rc_pairs_mutation_on_different_types() {
+        let src = "
+        brillig(inline) fn mutator f0 {
+          b0(v0: [Field; 3], v1: [Field; 5]):
+            inc_rc v0
+            inc_rc v1
+            v2 = allocate -> &mut [Field; 3]
+            store v0 at v2
+            v3 = load v2 -> [Field; 3]
+            v6 = array_set v3, index u32 0, value Field 5
+            store v6 at v2
+            v8 = array_get v1, index u32 1 -> Field
+            dec_rc v0
+            dec_rc v1
+            return
+        }
+        ";
+
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.remove_paired_rc();
+        // We expect the paired RC on v0 to remain, but we expect the paired RC on v1 to be removed
+        // as they operate over different types ([Field; 2] and [Field; 5]) respectively.
+        assert_ssa_snapshot!(ssa, @r"
+        brillig(inline) fn mutator f0 {
+          b0(v0: [Field; 3], v1: [Field; 5]):
+            inc_rc v0
+            v2 = allocate -> &mut [Field; 3]
+            store v0 at v2
+            v3 = load v2 -> [Field; 3]
+            v6 = array_set v3, index u32 0, value Field 5
+            store v6 at v2
+            v8 = array_get v1, index u32 1 -> Field
+            dec_rc v0
+            return
+        }
+        ");
+    }
+
+    #[test]
+    fn multiple_rc_pairs_mutation_on_matching_types() {
+        let src = "
+        brillig(inline) fn mutator f0 {
+          b0(v0: [Field; 5], v1: [Field; 5]):
+            inc_rc v0
+            inc_rc v1
+            v2 = allocate -> &mut [Field; 5]
+            store v0 at v2
+            v3 = load v2 -> [Field; 5]
+            v6 = array_set v3, index u32 0, value Field 5
+            store v6 at v2
+            v8 = array_get v1, index u32 1 -> Field
+            dec_rc v0
+            dec_rc v1
+            return
+        }
+        ";
+
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.remove_paired_rc();
+        // We expect the paired RCs on v0 and v1 to remain as they operate over the same type ([Field; 5])
+        assert_ssa_snapshot!(ssa, @r"
+        brillig(inline) fn mutator f0 {
+          b0(v0: [Field; 5], v1: [Field; 5]):
+            inc_rc v0
+            inc_rc v1
+            v2 = allocate -> &mut [Field; 5]
+            store v0 at v2
+            v3 = load v2 -> [Field; 5]
+            v6 = array_set v3, index u32 0, value Field 5
+            store v6 at v2
+            v8 = array_get v1, index u32 1 -> Field
+            dec_rc v0
+            dec_rc v1
+            return
+        }
+        ");
+    }
+
+    #[test]
+    fn rc_pair_with_same_type_but_different_values() {
+        let src = "
+        brillig(inline) fn foo f0 {
+          b0(v0: [Field; 2], v1: [Field; 2]):
+            inc_rc v0
+            dec_rc v1
+            v2 = make_array [v0] : [[Field; 2]; 1]
+            return v2
+        }
+        ";
+        assert_ssa_does_not_change(src, Ssa::remove_paired_rc);
+    }
+
+    #[test]
+    fn do_not_remove_pairs_across_blocks() {
+        let src = "
+        brillig(inline) fn foo f0 {
+          b0(v0: [Field; 2]):
+            inc_rc v0
+            jmp b1()
+          b1():
+            dec_rc v0
+            jmp b2()
+          b2():
+            v1 = make_array [v0] : [[Field; 2]; 1]
+            return v1  
+        }
+        ";
+        // This pass is very conservative and only looks for inc_rc's in the entry block and dec_rc's in the exit block
+        // The dec_rc is not in the return block so we do not expect the rc pair to be removed.
+        assert_ssa_does_not_change(src, Ssa::remove_paired_rc);
+    }
+
+    #[test]
+    fn remove_pair_across_blocks() {
+        let src = "
+        brillig(inline) fn foo f0 {
+          b0(v0: [Field; 2]):
+            inc_rc v0
+            jmp b1()
+          b1():
+            jmp b2()
+          b2():
+            dec_rc v0
+            v1 = make_array [v0] : [[Field; 2]; 1]
+            return v1  
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.remove_paired_rc();
+        // As the program has an RC pair where the increment is in the entry block and
+        // the decrement is in the return block this pair is safe to remove.
+        assert_ssa_snapshot!(ssa, @r"
+        brillig(inline) fn foo f0 {
+          b0(v0: [Field; 2]):
+            jmp b1()
+          b1():
+            jmp b2()
+          b2():
+            v1 = make_array [v0] : [[Field; 2]; 1]
+            return v1
+        }
+        ");
     }
 }

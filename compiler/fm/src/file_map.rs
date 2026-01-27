@@ -1,7 +1,9 @@
-use codespan_reporting::files::{Error, Files, SimpleFile, SimpleFiles};
+use codespan_reporting::files::{Error, Files, SimpleFile};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{ops::Range, path::PathBuf};
+
+use crate::simple_files::SimpleFiles;
 
 // XXX: File and FileMap serve as opaque types, so that the rest of the library does not need to import the dependency
 // or worry about when we change the dep
@@ -19,6 +21,10 @@ impl PathString {
     pub fn from_path(p: PathBuf) -> Self {
         PathString(p)
     }
+
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
 }
 impl From<PathBuf> for PathString {
     fn from(pb: PathBuf) -> PathString {
@@ -34,6 +40,7 @@ impl From<&PathBuf> for PathString {
 pub struct FileMap {
     files: SimpleFiles<PathString, String>,
     name_to_id: HashMap<PathString, FileId>,
+    current_dir: Option<PathBuf>,
 }
 
 // XXX: Note that we derive Default here due to ModuleOrigin requiring us to set a FileId
@@ -48,7 +55,7 @@ impl FileId {
         self.0
     }
 
-    pub fn dummy() -> FileId {
+    pub const fn dummy() -> FileId {
         FileId(0)
     }
 }
@@ -68,6 +75,10 @@ impl FileMap {
         file_id
     }
 
+    pub fn replace_file(&mut self, file_id: FileId, source: String) {
+        self.files.replace(file_id.0, source);
+    }
+
     pub fn get_file(&self, file_id: FileId) -> Option<File> {
         self.files.get(file_id.0).map(File).ok()
     }
@@ -79,10 +90,32 @@ impl FileMap {
     pub fn all_file_ids(&self) -> impl Iterator<Item = &FileId> {
         self.name_to_id.values()
     }
+
+    pub fn get_name(&self, file_id: FileId) -> Result<PathString, Error> {
+        let name = self.get_absolute_name(file_id)?;
+
+        // See if we can make the file name a bit shorter/easier to read if it starts with the current directory
+        if let Some(current_dir) = &self.current_dir {
+            if let Ok(name_without_prefix) = name.0.strip_prefix(current_dir) {
+                return Ok(PathString::from_path(name_without_prefix.to_path_buf()));
+            }
+        }
+
+        Ok(name)
+    }
+
+    pub fn get_absolute_name(&self, file_id: FileId) -> Result<PathString, Error> {
+        let name = self.files.get(file_id.as_usize())?.name().clone();
+        Ok(name)
+    }
 }
 impl Default for FileMap {
     fn default() -> Self {
-        FileMap { files: SimpleFiles::new(), name_to_id: HashMap::new() }
+        FileMap {
+            files: SimpleFiles::new(),
+            name_to_id: HashMap::new(),
+            current_dir: std::env::current_dir().ok(),
+        }
     }
 }
 
@@ -92,7 +125,7 @@ impl<'a> Files<'a> for FileMap {
     type Source = &'a str;
 
     fn name(&self, file_id: Self::FileId) -> Result<Self::Name, Error> {
-        Ok(self.files.get(file_id.as_usize())?.name().clone())
+        self.get_name(file_id)
     }
 
     fn source(&'a self, file_id: Self::FileId) -> Result<Self::Source, Error> {

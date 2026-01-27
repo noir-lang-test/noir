@@ -1,17 +1,14 @@
-use fm::FileId;
-use lsp_types::{
-    DeclarationCapability, DefinitionOptions, DocumentSymbolOptions, HoverOptions,
-    InlayHintOptions, OneOf, ReferencesOptions, RenameOptions, TypeDefinitionProviderCapability,
+use async_lsp::lsp_types::{
+    CodeActionOptions, CompletionOptions, DeclarationCapability, DefinitionOptions,
+    DocumentSymbolOptions, HoverOptions, InlayHintOptions, OneOf, ReferencesOptions, RenameOptions,
+    SemanticTokensOptions, SemanticTokensRegistrationOptions, SignatureHelpOptions,
+    TextDocumentIdentifier, TypeDefinitionProviderCapability, WorkspaceSymbolOptions,
 };
-use noirc_driver::DebugFile;
-use noirc_errors::{debug_info::OpCodesCount, Location};
 use noirc_frontend::graph::CrateName;
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
-use std::collections::{BTreeMap, HashMap};
 
 // Re-providing lsp_types that we don't need to override
-pub(crate) use lsp_types::{
+pub(crate) use async_lsp::lsp_types::{
     CodeLens, CodeLensOptions, CodeLensParams, Command, Diagnostic, DiagnosticSeverity,
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, InitializedParams,
@@ -19,15 +16,19 @@ pub(crate) use lsp_types::{
 };
 
 pub(crate) mod request {
-    use lsp_types::{request::Request, InitializeParams};
+    use async_lsp::lsp_types::{InitializeParams, request::Request};
+
+    use crate::types::{
+        NargoExpandParams, NargoExpandResult, NargoStdSourceCodeParams, NargoStdSourceCodeResult,
+    };
 
     use super::{
-        InitializeResult, NargoProfileRunParams, NargoProfileRunResult, NargoTestRunParams,
-        NargoTestRunResult, NargoTestsParams, NargoTestsResult,
+        InitializeResult, NargoTestRunParams, NargoTestRunResult, NargoTestsParams,
+        NargoTestsResult,
     };
 
     // Re-providing lsp_types that we don't need to override
-    pub(crate) use lsp_types::request::{
+    pub(crate) use async_lsp::lsp_types::request::{
         CodeLensRequest as CodeLens, Formatting, GotoDeclaration, GotoDefinition,
         GotoTypeDefinition, Shutdown,
     };
@@ -57,21 +58,29 @@ pub(crate) mod request {
     }
 
     #[derive(Debug)]
-    pub(crate) struct NargoProfileRun;
-    impl Request for NargoProfileRun {
-        type Params = NargoProfileRunParams;
-        type Result = NargoProfileRunResult;
-        const METHOD: &'static str = "nargo/profile/run";
+    pub(crate) struct NargoExpand;
+    impl Request for NargoExpand {
+        type Params = NargoExpandParams;
+        type Result = NargoExpandResult;
+        const METHOD: &'static str = "nargo/expand";
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct NargoStdSourceCode;
+    impl Request for NargoStdSourceCode {
+        type Params = NargoStdSourceCodeParams;
+        type Result = NargoStdSourceCodeResult;
+        const METHOD: &'static str = "nargo/std-source-code";
     }
 }
 
 pub(crate) mod notification {
-    use lsp_types::notification::Notification;
+    use async_lsp::lsp_types::notification::Notification;
 
     use super::NargoPackageTests;
 
     // Re-providing lsp_types that we don't need to override
-    pub(crate) use lsp_types::notification::{
+    pub(crate) use async_lsp::lsp_types::notification::{
         DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
         DidSaveTextDocument, Exit, Initialized,
     };
@@ -156,6 +165,31 @@ pub(crate) struct ServerCapabilities {
     /// The server provides document symbol support.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) document_symbol_provider: Option<OneOf<bool, DocumentSymbolOptions>>,
+
+    /// The server provides completion support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) completion_provider: Option<OneOf<bool, CompletionOptions>>,
+
+    /// The server provides signature help support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) signature_help_provider: Option<OneOf<bool, SignatureHelpOptions>>,
+
+    /// The server provides code action support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) code_action_provider: Option<OneOf<bool, CodeActionOptions>>,
+
+    /// The server provides workspace symbol support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_symbol_provider: Option<OneOf<bool, WorkspaceSymbolOptions>>,
+
+    /// The server provides folding range support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) folding_range_provider: Option<bool>,
+
+    /// The server provides semantic token support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) semantic_tokens_provider:
+        Option<OneOf<SemanticTokensOptions, SemanticTokensRegistrationOptions>>,
 }
 
 #[derive(Debug, PartialEq, Clone, Default, Deserialize, Serialize)]
@@ -240,18 +274,25 @@ pub(crate) struct NargoTestRunResult {
     pub(crate) result: String,
     pub(crate) message: Option<String>,
 }
+
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct NargoProfileRunParams {
-    pub(crate) package: CrateName,
-}
-#[serde_as]
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct NargoProfileRunResult {
-    pub(crate) file_map: BTreeMap<FileId, DebugFile>,
-    #[serde_as(as = "Vec<(_, _)>")]
-    pub(crate) opcodes_counts: HashMap<Location, OpCodesCount>,
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NargoExpandParams {
+    pub(crate) text_document: TextDocumentIdentifier,
+    pub(crate) position: Position,
 }
 
+pub(crate) type NargoExpandResult = String;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NargoStdSourceCodeParams {
+    pub(crate) uri: Url,
+}
+
+pub(crate) type NargoStdSourceCodeResult = String;
+
 pub(crate) type CodeLensResult = Option<Vec<CodeLens>>;
-pub(crate) type GotoDefinitionResult = Option<lsp_types::GotoDefinitionResponse>;
-pub(crate) type GotoDeclarationResult = Option<lsp_types::request::GotoDeclarationResponse>;
+pub(crate) type GotoDefinitionResult = Option<async_lsp::lsp_types::GotoDefinitionResponse>;
+pub(crate) type GotoDeclarationResult =
+    Option<async_lsp::lsp_types::request::GotoDeclarationResponse>;
