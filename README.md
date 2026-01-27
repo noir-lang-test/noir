@@ -8,7 +8,7 @@
 
 
 
-# The Noir Programming Language
+# The Nico Programming Language
 
 [![Non-deterministic fuzz tests](https://github.com/noir-lang/noir/actions/workflows/nightly-fuzz-test.yml/badge.svg)](https://github.com/noir-lang/noir/actions/workflows/nightly-fuzz-test.yml)
 
